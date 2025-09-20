@@ -1,1 +1,7 @@
-
+services:
+  - type: web
+    name: billxpert-converter
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app.main:app"
+    plan: free
