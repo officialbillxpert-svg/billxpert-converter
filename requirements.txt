@@ -1,2 +1,6 @@
 flask
 gunicorn
+lxml
+pandas
+factur-x           # extraction XML intégré au PDF Factur-X
+pdfminer.six       # secours si besoin
