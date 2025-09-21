@@ -1,8 +1,7 @@
 # app/main.py
-from flask import Flask, request, jsonify, send_file, render_template_string, Response
+from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
 import tempfile, os, io, csv
-
 from extractors.pdf_basic import extract_pdf
 
 app = Flask(__name__)
@@ -16,9 +15,7 @@ HTML_FORM = """
   <input type="file" name="file" accept="application/pdf" required>
   <button type="submit">Exporter CSV</button>
 </form>
-<p style="margin-top:12px">
-  Ou test JSON :
-</p>
+<p style="margin-top:12px">Ou test JSON :</p>
 <form method="post" action="/api/convert" enctype="multipart/form-data">
   <input type="file" name="file" accept="application/pdf" required>
   <button type="submit">Voir JSON</button>
@@ -48,8 +45,10 @@ def api_convert_json():
         data = extract_pdf(path)
         return jsonify(data)
     finally:
-        try: import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
-        except: pass
+        try:
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+        except:
+            pass
 
 @app.post("/api/convert.csv")
 def api_convert_csv():
@@ -62,33 +61,36 @@ def api_convert_csv():
     path, tmpdir = _save_upload(f)
     try:
         data = extract_pdf(path)
-        # Construire un CSV simple (en-têtes stables)
-       # ... après data = extract_pdf(path)
-output = io.StringIO()
-writer = csv.writer(output, delimiter=';', lineterminator='\r\n')
-writer.writerow(["invoice_number","seller","buyer","total","currency"])
-fields = data.get("fields", {})
-writer.writerow([
-    fields.get("invoice_number",""),
-    fields.get("seller","N/A"),
-    fields.get("buyer","N/A"),
-    fields.get("total_ttc",""),
-    fields.get("currency","EUR"),
-])
 
-# Ajoute un BOM pour Excel/Calc
-csv_text = '\ufeff' + output.getvalue()
-csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+        # --- Construire un CSV en point-virgule (+ BOM + CRLF) ---
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';', lineterminator='\r\n')
+        writer.writerow(["invoice_number","seller","buyer","total","currency"])
 
-return send_file(
-    csv_bytes,
-    mimetype="text/csv; charset=utf-8",
-    as_attachment=True,
-    download_name="billxpert_convert.csv"
-)
+        fields = data.get("fields", {})
+        writer.writerow([
+            fields.get("invoice_number",""),
+            fields.get("seller","N/A"),
+            fields.get("buyer","N/A"),
+            fields.get("total_ttc",""),
+            fields.get("currency","EUR"),
+        ])
+
+        # BOM UTF-8 pour Excel/Calc
+        csv_text = '\ufeff' + output.getvalue()
+        csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+
+        return send_file(
+            csv_bytes,
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name="billxpert_convert.csv"
+        )
     finally:
-        try: import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
-        except: pass
+        try:
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+        except:
+            pass
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
