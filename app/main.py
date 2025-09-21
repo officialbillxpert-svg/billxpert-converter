@@ -63,23 +63,29 @@ def api_convert_csv():
     try:
         data = extract_pdf(path)
         # Construire un CSV simple (en-têtes stables)
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["filename","invoice_number","date","total_ttc"])
-        fields = data.get("fields", {})
-        writer.writerow([
-            data.get("meta",{}).get("filename",""),
-            fields.get("invoice_number",""),
-            fields.get("date",""),
-            fields.get("total_ttc",""),
-        ])
-        csv_bytes = io.BytesIO(output.getvalue().encode("utf-8"))
-        return send_file(
-            csv_bytes,
-            mimetype="text/csv; charset=utf-8",
-            as_attachment=True,
-            download_name="billxpert-extraction.csv"
-        )
+       # ... après data = extract_pdf(path)
+output = io.StringIO()
+writer = csv.writer(output, delimiter=';', lineterminator='\r\n')
+writer.writerow(["invoice_number","seller","buyer","total","currency"])
+fields = data.get("fields", {})
+writer.writerow([
+    fields.get("invoice_number",""),
+    fields.get("seller","N/A"),
+    fields.get("buyer","N/A"),
+    fields.get("total_ttc",""),
+    fields.get("currency","EUR"),
+])
+
+# Ajoute un BOM pour Excel/Calc
+csv_text = '\ufeff' + output.getvalue()
+csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+
+return send_file(
+    csv_bytes,
+    mimetype="text/csv; charset=utf-8",
+    as_attachment=True,
+    download_name="billxpert_convert.csv"
+)
     finally:
         try: import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
         except: pass
