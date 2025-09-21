@@ -1,11 +1,10 @@
-# app/main.py
 from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
 import tempfile, os, io, csv
 from extractors.pdf_basic import extract_pdf
 
 app = Flask(__name__)
-CORS(app)  # autorise appels depuis ton domaine WP si besoin
+CORS(app)
 
 HTML_FORM = """
 <!doctype html><meta charset="utf-8">
@@ -62,7 +61,7 @@ def api_convert_csv():
     try:
         data = extract_pdf(path)
 
-        # --- Construire un CSV en point-virgule (+ BOM + CRLF) ---
+        # CSV en ; + CRLF + BOM pour Excel/Calc
         output = io.StringIO()
         writer = csv.writer(output, delimiter=';', lineterminator='\r\n')
         writer.writerow(["invoice_number","seller","buyer","total","currency"])
@@ -76,8 +75,7 @@ def api_convert_csv():
             fields.get("currency","EUR"),
         ])
 
-        # BOM UTF-8 pour Excel/Calc
-        csv_text = '\ufeff' + output.getvalue()
+        csv_text = '\ufeff' + output.getvalue()          # BOM UTF-8
         csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
 
         return send_file(
