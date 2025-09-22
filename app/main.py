@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
 import tempfile, os, io, csv
-from extractors.pdf_basic import extract_pdf
+# après
+from .extractors.pdf_basic import extract_pdf
 
 app = Flask(__name__)
 CORS(app)
