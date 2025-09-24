@@ -193,10 +193,6 @@ def summarize_from_csv(csv_bytes: bytes) -> Dict[str, Any]:
         "lines_count": n_lines or None,
     }
 
-# --- nouvelle route ---
-from fastapi import UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-
 @app.post("/api/summary")
 async def summary(file: UploadFile = File(...)):
     # 1) Valide PDF
