@@ -3,6 +3,7 @@ from flask_cors import CORS
 import tempfile, os, io, csv
 # après
 from .extractors.pdf_basic import extract_pdf
+from extractors.summary import summarize_from_text, summarize_from_csv
 
 app = Flask(__name__)
 CORS(app)
