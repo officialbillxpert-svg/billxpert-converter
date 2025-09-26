@@ -91,6 +91,55 @@ def api_convert_csv():
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+@app.post("/api/summary")
+def api_summary():
+    if "file" not in request.files:
+        return jsonify({"success": False, "error": "file_missing"}), 400
+    f = request.files["file"]
+    if not f.filename.lower().endswith(".pdf"):
+        return jsonify({"success": False, "error": "not_pdf"}), 400
+
+    path, tmpdir = _save_upload(f)
+    try:
+        data = extract_pdf(path) or {}
+        fields = data.get("fields", {}) if isinstance(data, dict) else {}
+
+        # base du résumé
+        summary = {
+            "invoice_number": fields.get("invoice_number"),
+            "invoice_date":   fields.get("invoice_date"),
+            "seller":         fields.get("seller"),
+            "seller_siret":   fields.get("seller_siret"),
+            "seller_tva":     fields.get("seller_tva"),
+            "seller_iban":    fields.get("seller_iban"),
+            "buyer":          fields.get("buyer"),
+            "total_ht":       fields.get("total_ht"),
+            "total_tva":      fields.get("total_tva"),
+            "total_ttc":      fields.get("total_ttc"),
+            "currency":       fields.get("currency", "EUR"),
+            "lines_count":    fields.get("lines_count"),
+        }
+
+        # heuristiques texte (remplit les trous)
+        raw_text = data.get("text") if isinstance(data, dict) else None
+        if not raw_text:
+            try:
+                raw_text = " ".join(str(v) for v in fields.values() if v)
+            except Exception:
+                raw_text = ""
+        if raw_text:
+            auto = summarize_from_text(raw_text)
+            for k, v in auto.items():
+                if summary.get(k) in (None, "", 0) and v not in (None, "", 0):
+                    summary[k] = v
+
+        return jsonify(summary)
+    finally:
+        try:
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+        except:
+            pass
+
 # Résumé
 @app.post("/api/summary")
 def api_summary():
