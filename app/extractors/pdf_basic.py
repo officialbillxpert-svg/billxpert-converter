@@ -3,12 +3,13 @@ from pdfminer.high_level import extract_text
 from dateutil import parser as dateparser
 from pathlib import Path
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
-# --- regex de base ---
+# --- Regex de base ---
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
-TOTAL_RE = re.compile(r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
+TOTAL_RE = re.compile(
+    r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
     re.I
 )
 EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)')
@@ -20,17 +21,67 @@ TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
 IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
 
 # Blocs parties
-SELLER_RX = re.compile(r"(?:Émetteur|Vendeur|Seller)\s*:\s*(.+)", re.I)
-BUYER_RX  = re.compile(r"(?:Client|Acheteur|Buyer)\s*:\s*(.+)", re.I)
+SELLER_BLOCK = re.compile(
+    r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)',
+    re.I | re.S
+)
+CLIENT_BLOCK = re.compile(
+    r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)',
+    re.I | re.S
+)
 
-# --- AJOUTS : taux TVA (20/10/5.5) et complétion des totaux ---
+# Lignes du tableau : "PREST-001 — Libellé ...  12  10,00 €  120,00 €"
+LINE_RX = re.compile(
+    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
+    r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
+    re.M
+)
+
+# Taux TVA
 VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
 
-def _infer_totals(total_ttc, total_ht, total_tva, vat_rate):
-    """
-    Complète HT/TVA/TTC si on connaît un taux (ex: 20 -> 0.20).
-    Retourne (ht, tva, ttc).
-    """
+
+# ---------- Helpers ----------
+def _norm_amount(s: str) -> Optional[float]:
+    if not s:
+        return None
+    s = s.strip().replace(' ', '')
+    # normaliser 1 234,56 / 1.234,56 / 1234.56
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
+    try:
+        return round(float(s), 2)
+    except Exception:
+        return None
+
+def _clean_block(s: str) -> Optional[str]:
+    s = re.sub(r'\s+', ' ', s or '').strip()
+    return s or None
+
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for m in LINE_RX.finditer(text):
+        qty = int(m.group('qty'))
+        pu  = _norm_amount(m.group('pu'))
+        amt = _norm_amount(m.group('amt'))
+        rows.append({
+            "ref":        m.group('ref'),
+            "label":      m.group('label').strip(),
+            "qty":        qty,
+            "unit_price": pu,
+            "amount":     amt
+        })
+    return rows
+
+def _approx(a: Optional[float], b: Optional[float], tol: float = 1.0) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol
+
+def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Complète HT/TVA/TTC si on connaît un taux (ex: 20 -> 0.20)."""
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
@@ -66,32 +117,19 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate):
 
     return ht, tva, ttc
 
-def _norm_amount(s: str) -> Optional[float]:
-    if not s:
-        return None
-    s = s.strip().replace(' ', '')
-    # normaliser 1 234,56 / 1.234,56 / 1234.56
-    if ',' in s and '.' in s:
-        # supposer . = milliers, , = décimales
-        s = s.replace('.', '').replace(',', '.')
-    elif ',' in s:
-        s = s.replace(',', '.')
-    try:
-        return round(float(s), 2)
-    except Exception:
-        return None
 
+# ---------- Extraction principale ----------
 def extract_pdf(path: str) -> Dict[str, Any]:
     p = Path(path)
     text = extract_text(p) or ""
 
     meta = {
         "bytes": p.stat().st_size if p.exists() else None,
-        "pages": text.count("\f") + 1 if text else 0,
+        "pages": (text.count("\f") + 1) if text else 0,
         "filename": p.name,
     }
 
-    # -------- Champs simples (numéro, date, total TTC) --------
+    # Champs simples
     m_num = NUM_RE.search(text)
     invoice_number = m_num.group(1).strip() if m_num else None
 
@@ -106,74 +144,51 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     m_total = TOTAL_RE.search(text)
     total_ttc = _norm_amount(m_total.group(1)) if m_total else None
     if total_ttc is None:
-        # fallback: prendre une “grosse” somme du doc (prudent)
+        # fallback: grosse somme
         amounts = [_norm_amount(a) for a in EUR_RE.findall(text)]
         amounts = [a for a in amounts if a is not None]
         if amounts:
             total_ttc = max(amounts)
 
-    # --- Devise plus large ---
+    # Devise
     currency = None
-    if re.search(r"\bEUR\b|€", text, re.I):
-        currency = "EUR"
-    elif re.search(r"\bGBP\b|£", text, re.I):
-        currency = "GBP"
-    elif re.search(r"\bCHF\b", text, re.I):
-        currency = "CHF"
-    elif re.search(r"\bUSD\b|\$", text, re.I):
-        currency = "USD"
+    if re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
+    elif re.search(r"\bGBP\b|£", text, re.I): currency = "GBP"
+    elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
+    elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
 
-    # --- Taux TVA et complétion HT/TVA ---
+    # Taux TVA
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
     if m_vat:
-        vat_rate = m_vat.group(1).replace(',', '.')
-        if vat_rate in ('5.5', '5,5'):
-            vat_rate = '5.5'  # uniformiser
+        vr = m_vat.group(1)
+        vat_rate = '5.5' if vr in ('5,5', '5.5') else vr  # uniformiser 5,5 → 5.5
 
-    total_ht = None
-    total_tva = None
-    if vat_rate is not None:
-        total_ht, total_tva, total_ttc = _infer_totals(total_ttc, total_ht, total_tva, vat_rate)
-
-    # -------- Résultat initial --------
+    # Résultat initial
     result: Dict[str, Any] = {
         "success": True,
         "meta": meta,
         "fields": {
             "invoice_number": invoice_number,
-            "invoice_date": invoice_date,   # clé uniforme
-            "total_ht": total_ht,
-            "total_tva": total_tva,
+            "invoice_date":   invoice_date,
+            "total_ht":  None,
+            "total_tva": None,
             "total_ttc": total_ttc,
-            "currency": currency or "EUR",
-            # seller / buyer / ids FR seront complétés plus bas
+            "currency":  currency or "EUR",
         },
-        "text": text[:20000],        # utile pour heuristiques & debug (limité)
-        "text_preview": text[:2000], # très court pour affichage rapide
+        "text": text[:20000],
+        "text_preview": text[:2000],
     }
-
-    # -------- Heuristiques rapides pour compléter --------
     fields = result["fields"]
 
-    # Seller / Buyer explicites
-    m = SELLER_RX.search(text)
+    # Vendeur / Client (blocs)
+    m = SELLER_BLOCK.search(text)
     if m and not fields.get("seller"):
-        fields["seller"] = m.group(1).strip()
+        fields["seller"] = _clean_block(m.group('blk'))
 
-    m = BUYER_RX.search(text)
+    m = CLIENT_BLOCK.search(text)
     if m and not fields.get("buyer"):
-        fields["buyer"] = m.group(1).strip()
-
-    # Fallback ultra-simple si seller/buyer absents
-    if not fields.get("seller"):
-        head = [l.strip() for l in text.splitlines()[:8] if l.strip()]
-        if head:
-            fields["seller"] = head[0][:120]
-    if not fields.get("buyer"):
-        m_billto = re.search(r"(?:Bill\s*to|Facturé\s*à|Client)\s*:?\s*(.+)", text, re.I)
-        if m_billto:
-            fields["buyer"] = m_billto.group(1).strip()[:160]
+        fields["buyer"] = _clean_block(m.group('blk'))
 
     # Identifiants FR (vendeur)
     m = TVA_RE.search(text)
@@ -186,15 +201,36 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     elif not fields.get("seller_siret"):
         m2 = SIREN_RE.search(text)
         if m2:
-            fields["seller_siret"] = m2.group(0)  # au pire, SIREN
+            fields["seller_siret"] = m2.group(0)
 
     m = IBAN_RE.search(text)
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
 
-    # Compter d’éventuelles lignes si tu ajoutes result["lines"] ailleurs
-    lines = result.get("lines")
-    if isinstance(lines, list) and not fields.get("lines_count"):
+    # Lignes d'articles
+    lines = _parse_lines(text)
+    if lines:
+        result["lines"] = lines
         fields["lines_count"] = len(lines)
+
+        # Somme des montants des lignes
+        sum_lines = round(sum([(r.get("amount") or 0.0) for r in lines]), 2)
+
+        # On décide si les montants de lignes sont HT ou TTC :
+        # - si sum_lines ~ total_ttc → on considère que c'est TTC
+        # - sinon on les traite comme HT
+        if total_ttc and _approx(sum_lines, total_ttc, tol=1.5):
+            # lignes = TTC → calcule HT/TVA à partir de TTC
+            total_ht, total_tva, total_ttc2 = _infer_totals(total_ttc, None, None, vat_rate)
+            fields["total_ht"]  = total_ht
+            fields["total_tva"] = total_tva
+            fields["total_ttc"] = total_ttc2 or total_ttc
+        else:
+            # lignes = HT (cas le plus courant)
+            total_ht = sum_lines if sum_lines else None
+            th, tv, tt = _infer_totals(total_ttc, total_ht, None, vat_rate)
+            if th is not None: fields["total_ht"]  = th
+            if tv is not None: fields["total_tva"] = tv
+            if tt is not None: fields["total_ttc"] = tt
 
     return result
