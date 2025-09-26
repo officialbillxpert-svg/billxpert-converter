@@ -138,6 +138,9 @@ def api_summary():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     # Run local : python -m app.main
