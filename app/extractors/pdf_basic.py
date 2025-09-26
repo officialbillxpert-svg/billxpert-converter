@@ -8,7 +8,9 @@ from typing import Optional, Dict, Any
 # --- regex de base ---
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
-TOTAL_RE = re.compile(r'(?:Total\s*(?:TTC)?|Montant\s*TTC)\s*[:€]*\s*([0-9][0-9\.\,\s]+)', re.I)
+TOTAL_RE = re.compile(r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
+    re.I
+)
 EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)')
 
 # Identifiants FR
