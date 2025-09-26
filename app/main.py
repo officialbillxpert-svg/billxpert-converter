@@ -138,8 +138,8 @@ def api_summary():
                 if v and summary.get(k) in (None, "", 0):
                     summary[k] = v
 
-        # Si ton parseur sait aussi générer un CSV détaillé, tu peux
-        # l’appeler ici et fusionner avec summarize_from_csv(csv_bytes)
+        # Si tu ajoutes plus tard un export CSV détaillé des lignes :
+        # csv_bytes = build_detail_csv(data)  # puis fusion via summarize_from_csv(csv_bytes)
 
         return jsonify(summary)
     finally:
@@ -148,5 +148,5 @@ def api_summary():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Pour un run local : python -m app.main
+    # Run local : python -m app.main
     app.run(host="0.0.0.0", port=5000)
