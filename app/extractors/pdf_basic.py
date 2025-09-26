@@ -66,5 +66,34 @@ def extract_pdf(path: str) -> dict:
         },
         "text_preview": text[:2000]  # utile pour debug
     }
+
+    # ---- Heuristiques rapides pour compléter les champs manquants ----
+text = (result.get("text") or "").strip()
+fields = result.setdefault("fields", {})
+
+# Seller / Buyer (très simple : blocs "Émetteur" / "Client")
+import re
+SELLER_RX = re.compile(r"(?:Émetteur|Vendeur|Seller)\s*:\s*(.+)", re.I)
+BUYER_RX  = re.compile(r"(?:Client|Acheteur|Buyer)\s*:\s*(.+)", re.I)
+
+m = SELLER_RX.search(text)
+if m and not fields.get("seller"):
+    fields["seller"] = m.group(1).strip()
+
+m = BUYER_RX.search(text)
+if m and not fields.get("buyer"):
+    fields["buyer"] = m.group(1).strip()
+
+# Devise (si « EUR », « € », « USD », …)
+if not fields.get("currency"):
+    if re.search(r"\bEUR\b|€", text, re.I): fields["currency"] = "EUR"
+    elif re.search(r"\bUSD\b|\$", text, re.I): fields["currency"] = "USD"
+
+# Compte les lignes si tu as déjà une liste de lignes quelque part
+lines = result.get("lines")
+if isinstance(lines, list) and not fields.get("lines_count"):
+    fields["lines_count"] = len(lines)
+
+    
     return result
 
