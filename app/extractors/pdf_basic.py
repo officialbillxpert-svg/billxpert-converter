@@ -311,32 +311,32 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
         return []
         
     # --- Lignes d'articles ---
-    # 1) Essayer tableau structuré (pdfplumber)
+# 1) Essayer tableau structuré (pdfplumber) si dispo
+lines: List[Dict[str, Any]] = []
+try:
     lines = _parse_lines_with_pdfplumber(str(p))
-    # 2) Fallback regex sur texte brut si rien trouvé
-    if not lines:
-        lines = _parse_lines(text)
+except Exception:
+    lines = []
+# 2) Fallback regex sur texte brut si rien trouvé
+if not lines:
+    lines = _parse_lines(text)
 
-    if lines:
-        result["lines"] = lines
-        fields["lines_count"] = len(lines)
+if lines:
+    result["lines"] = lines
+    fields["lines_count"] = len(lines)
 
-        # Somme des montants lignes
-        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
+    sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
 
-        # Décider si lignes = TTC ou HT (heuristique)
-        if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
-            # lignes ≈ TTC → compléter HT/TVA depuis TTC
-            total_ht, total_tva, total_ttc2 = _infer_totals(total_ttc, None, None, vat_rate)
-            fields["total_ht"]  = total_ht
-            fields["total_tva"] = total_tva
-            fields["total_ttc"] = total_ttc2 or total_ttc
-        else:
-            # Sinon considérer lignes = HT et compléter si possible
-            total_ht = sum_lines if sum_lines else fields.get("total_ht")
-            th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
-            if th is not None: fields["total_ht"]  = th
-            if tv is not None: fields["total_tva"] = tv
-            if tt is not None: fields["total_ttc"] = tt
+    if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
+        total_ht, total_tva, total_ttc2 = _infer_totals(total_ttc, None, None, vat_rate)
+        fields["total_ht"]  = total_ht
+        fields["total_tva"] = total_tva
+        fields["total_ttc"] = total_ttc2 or total_ttc
+    else:
+        total_ht = sum_lines if sum_lines else fields.get("total_ht")
+        th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
+        if th is not None: fields["total_ht"]  = th
+        if tv is not None: fields["total_tva"] = tv
+        if tt is not None: fields["total_ttc"] = tt
 
     return result
