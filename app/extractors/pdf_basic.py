@@ -1,48 +1,72 @@
 # app/extractors/pdf_basic.py
+from __future__ import annotations
+
 from pdfminer.high_level import extract_text
 from dateutil import parser as dateparser
 from pathlib import Path
 import re
 from typing import Optional, Dict, Any, List, Tuple
 
-# pdfplumber optionnel (on fonctionne sans)
+# --- import optionnel de pdfplumber (si installé sur l'instance) ---
 try:
-    import pdfplumber
+    import pdfplumber  # type: ignore
 except Exception:
     pdfplumber = None
 
-# --------- REGEX de base ---------
+# =============== Regex de base ===============
+
+# numéro/date
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
-TOTAL_RE = re.compile(
-    r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
+
+# totaux (HT / TVA / TTC)
+TOTAL_TTC_RE = re.compile(
+    r'(?:Total\s*(?:TTC)?|Total\s*amount|Grand\s*total|Total\s*à\s*payer)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
     re.I
 )
-EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)')
+TOTAL_HT_RE = re.compile(
+    r'(?:Total\s*HT)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
+    re.I
+)
+TVA_AMOUNT_RE = re.compile(
+    r'(?:TVA(?:\s*\([^)]+\))?)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
+    re.I
+)
 
+# toute somme "euros" générique
+EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
+
+# Identifiants FR
 SIRET_RE = re.compile(r'\b\d{14}\b')
 SIREN_RE = re.compile(r'(?<!\d)\d{9}(?!\d)')
+# IBAN FR avec ou sans espaces (FR + 2 chiffres + blocs de chiffres)
+IBAN_RE  = re.compile(r'\bFR\d{2}(?:[ ]?\d{4}){5}\b', re.I)
 TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
-IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
 
+# Blocs parties
 SELLER_BLOCK = re.compile(
     r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)',
     re.I | re.S
 )
 CLIENT_BLOCK = re.compile(
-    r'(?:Client|Acheteur|Buyer|Bill\s*to)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)',
+    r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)',
     re.I | re.S
 )
 
-# fallback “tout-en-une-ligne”
-LINE_RX = re.compile(
-    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
-    r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
+# Détection du titre d'une ligne article (fallback texte)
+# Ex: "PREST-001 — Développement"
+LINE_TITLE_RX = re.compile(
+    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s*$',
     re.M
 )
 
+# Quantité sur une ligne seule (extraits en colonne)
+QTY_LINE_RX = re.compile(r'^\d{1,4}$', re.M)
+
+# Taux TVA mentionné (20 / 10 / 5,5)
 VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
 
+# Hints d'entêtes pour pdfplumber
 TABLE_HEADER_HINTS = [
     ("ref", "réf", "reference", "code"),
     ("désignation", "designation", "libellé", "description", "label"),
@@ -51,11 +75,13 @@ TABLE_HEADER_HINTS = [
     ("montant", "total", "amount")
 ]
 
-# --------- HELPERS ---------
-def _norm_amount(s: str) -> Optional[float]:
+# =============== Helpers ===============
+
+def _norm_amount(s: str | None) -> Optional[float]:
     if not s:
         return None
-    s = s.strip().replace(' ', '')
+    s = s.strip()
+    s = s.replace(' ', '')
     if ',' in s and '.' in s:
         s = s.replace('.', '').replace(',', '.')
     elif ',' in s:
@@ -65,7 +91,7 @@ def _norm_amount(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def _clean_block(s: str) -> Optional[str]:
+def _clean_block(s: str | None) -> Optional[str]:
     s = re.sub(r'\s+', ' ', s or '').strip()
     return s or None
 
@@ -75,17 +101,19 @@ def _approx(a: Optional[float], b: Optional[float], tol: float = 1.0) -> bool:
     return abs(a - b) <= tol
 
 def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Complète HT/TVA/TTC si on connaît un taux (ex: 20 -> 0.20)."""
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
+
     ht, tva, ttc = total_ht, total_tva, total_ttc
 
     if ttc is not None and (ht is None or tva is None):
         try:
             ht_calc = round(ttc / (1.0 + rate), 2)
             tva_calc = round(ttc - ht_calc, 2)
-            ht = ht if ht is not None else ht_calc
-            tva = tva if tva is not None else tva_calc
+            if ht is None:  ht = ht_calc
+            if tva is None: tva = tva_calc
         except Exception:
             pass
 
@@ -93,8 +121,8 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
         try:
             tva_calc = round(ht * rate, 2)
             ttc_calc = round(ht + tva_calc, 2)
-            tva = tva if tva is not None else tva_calc
-            ttc = ttc if ttc is not None else ttc_calc
+            if tva is None: tva = tva_calc
+            if ttc is None: ttc = ttc_calc
         except Exception:
             pass
 
@@ -106,7 +134,7 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
 
     return ht, tva, ttc
 
-# ---- pdfplumber helpers (optionnels) ----
+# ---------- pdfplumber helpers ----------
 def _norm_header_cell(s: str) -> str:
     s = (s or "").strip().lower()
     s = (s.replace("é","e").replace("è","e").replace("ê","e")
@@ -137,6 +165,7 @@ def _map_header_indices(headers: List[str]) -> Optional[Dict[str, int]]:
     return {k: v for k, v in idx.items() if v is not None}
 
 def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
+    """Tente d’extraire un tableau d’articles avec pdfplumber. Fallback [] si lib absente/échec."""
     if pdfplumber is None:
         return []
     rows: List[Dict[str, Any]] = []
@@ -153,99 +182,149 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                     tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
                     if not tbl or len(tbl) < 2:
                         continue
-                    idx = _map_header_indices(tbl[0])
+
+                    header = tbl[0]
+                    idx = _map_header_indices(header)
                     if not idx:
                         continue
+
                     for line in tbl[1:]:
-                        def get(i): return line[i] if (i is not None and i < len(line)) else ""
+                        def get(i):
+                            return line[i] if (i is not None and i < len(line)) else ""
                         ref   = get(idx.get("ref"))
                         label = get(idx.get("label")) or ref
-                        qty   = get(idx.get("qty"))
-                        pu    = get(idx.get("unit"))
-                        amt   = get(idx.get("amount"))
+                        qty_s = get(idx.get("qty"))
+                        pu_s  = get(idx.get("unit"))
+                        amt_s = get(idx.get("amount"))
+
                         try:
-                            qty = int(re.sub(r"[^\d]", "", qty)) if qty else None
+                            qty = int(re.sub(r"[^\d]", "", qty_s)) if qty_s else None
                         except Exception:
                             qty = None
-                        pu_f, amt_f = _norm_amount(pu), _norm_amount(amt)
+
+                        pu_f  = _norm_amount(pu_s)
+                        amt_f = _norm_amount(amt_s)
+
                         if not (label or pu_f is not None or amt_f is not None):
                             continue
+
                         rows.append({
-                            "ref": (ref or "").strip() or None,
-                            "label": (label or "").strip(),
-                            "qty": qty,
+                            "ref":        (ref or "").strip() or None,
+                            "label":      (label or "").strip(),
+                            "qty":        qty,
                             "unit_price": pu_f,
-                            "amount": amt_f
+                            "amount":     amt_f
                         })
         # dédoublonnage
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
-            if key in seen: continue
-            seen.add(key); uniq.append(r)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
         return uniq
     except Exception:
         return []
 
-# ---- Fallback lignes multi-lignes avec pdfminer ----
-def _parse_lines_text_multiline(lines: List[str]) -> List[Dict[str, Any]]:
+# ---------- Fallback « bloc » quand les colonnes sont sur des lignes séparées ----------
+def _parse_lines_blockwise(text: str) -> List[Dict[str, Any]]:
     """
-    Cherche des lignes de type:
-      'PREST-001 — Développement'
-      '1    1 000,00 €    1 000,00 €'
-    ou variantes (espaces variables).
+    1) Récupère les items par leur titre: 'REF — Libellé'
+    2) Récupère toutes les quantités présentes sur des lignes seules
+    3) Récupère toutes les valeurs monétaires, en filtrant les totaux (HT/TVA/TTC)
+    4) Associe qty + (pu,amount) séquentiellement aux items
     """
-    out: List[Dict[str, Any]] = []
-    i = 0
-    while i < len(lines):
-        l = lines[i]
-        m = re.match(r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+)$', l)
-        if m:
-            ref = m.group('ref').strip()
-            label = m.group('label').strip()
-            # cherche qté/pu/amt sur 1 ou 2 lignes suivantes
-            j = i + 1
-            qty = None; pu = None; amt = None
-            for _ in range(2):
-                if j >= len(lines): break
-                l2 = lines[j]
-                # ex: "1    1 000,00 €    1 000,00 €"
-                m2 = re.search(r'(?P<qty>\d{1,3})\s+([0-9\.\,\s]+€?)\s+([0-9\.\,\s]+€?)', l2)
-                if m2:
-                    qty = int(m2.group('qty'))
-                    # deux derniers nombres de la ligne
-                    nums = re.findall(r'([0-9][0-9\.\,\s]+)', l2)
-                    if len(nums) >= 2:
-                        pu  = _norm_amount(nums[-2])
-                        amt = _norm_amount(nums[-1])
-                    break
-                j += 1
-            out.append({
-                "ref": ref, "label": label,
-                "qty": qty, "unit_price": pu, "amount": amt
-            })
-            i = j + 1
-            continue
-        i += 1
-    return out
+    items = []
+    for m in LINE_TITLE_RX.finditer(text):
+        items.append({"ref": m.group("ref"), "label": m.group("label").strip()})
 
-def _parse_lines_text_one_line(text: str) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+
+    # Quantités en colonne
+    qtys = [int(q) for q in QTY_LINE_RX.findall(text)]
+
+    # Toutes les valeurs € du document
+    euros_all = [ _norm_amount(x) for x in EUR_RE.findall(text) ]
+    euros_all = [x for x in euros_all if x is not None]
+
+    # Essayer d’identifier les totaux pour les retirer du pool de montants lignes
+    totals_to_exclude: List[float] = []
+    m_ht = TOTAL_HT_RE.search(text)
+    if m_ht: 
+        v = _norm_amount(m_ht.group(1))
+        if v is not None: totals_to_exclude.append(v)
+    m_tv = TVA_AMOUNT_RE.search(text)
+    if m_tv:
+        v = _norm_amount(m_tv.group(1))
+        if v is not None: totals_to_exclude.append(v)
+    m_tc = TOTAL_TTC_RE.search(text)
+    if m_tc:
+        v = _norm_amount(m_tc.group(1))
+        if v is not None: totals_to_exclude.append(v)
+
+    euros = []
+    for v in euros_all:
+        # retire les totaux identifiés (tolérance)
+        if any(_approx(v, t, 0.5) for t in totals_to_exclude):
+            continue
+        euros.append(v)
+
+    # Heuristique d'association :
+    # - idéalement on a 2 * n_items valeurs (PU, MONTANT) pour chaque ligne.
+    # - sinon, si on a n_items valeurs, on considère que ce sont des montants TTC/HT et on calcule PU via qty.
+    n = len(items)
     rows: List[Dict[str, Any]] = []
-    for m in LINE_RX.finditer(text):
-        rows.append({
-            "ref": m.group('ref'),
-            "label": m.group('label').strip(),
-            "qty": int(m.group('qty')),
-            "unit_price": _norm_amount(m.group('pu')),
-            "amount": _norm_amount(m.group('amt')),
-        })
+    if len(euros) >= 2 * n:
+        # on prend les 2*n premières pour éviter d'attraper des mentions hors tableau
+        euros = euros[:2*n]
+        for i, it in enumerate(items):
+            qty = qtys[i] if i < len(qtys) else None
+            pu  = euros[2*i]
+            amt = euros[2*i+1]
+            # si qty manquante et pu/amt présents, on laisse qty=None
+            rows.append({
+                "ref": it["ref"],
+                "label": it["label"],
+                "qty": qty,
+                "unit_price": pu,
+                "amount": amt
+            })
+    elif len(euros) >= n:
+        # considérer que ce sont des montants (dernieres valeurs souvent = montants)
+        # on prend les n dernières valeurs (plus proches des lignes dans l'ordre visuel)
+        amounts = euros[-n:]
+        for i, it in enumerate(items):
+            qty = qtys[i] if i < len(qtys) else None
+            amt = amounts[i] if i < len(amounts) else None
+            pu = None
+            if qty and qty > 0 and amt is not None:
+                pu = round(amt / qty, 2)
+            rows.append({
+                "ref": it["ref"],
+                "label": it["label"],
+                "qty": qty,
+                "unit_price": pu,
+                "amount": amt
+            })
+    else:
+        # on n’a pas assez d’€ -> retourner titres + qty
+        for i, it in enumerate(items):
+            rows.append({
+                "ref": it["ref"],
+                "label": it["label"],
+                "qty": qtys[i] if i < len(qtys) else None,
+                "unit_price": None,
+                "amount": None
+            })
+
     return rows
 
-# --------- Extraction principale ---------
+# =============== Extraction principale ===============
 def extract_pdf(path: str) -> Dict[str, Any]:
     p = Path(path)
     text = extract_text(p) or ""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
     meta = {
         "bytes": p.stat().st_size if p.exists() else None,
@@ -253,23 +332,29 @@ def extract_pdf(path: str) -> Dict[str, Any]:
         "filename": p.name,
     }
 
-    # Numéro / Date / Total TTC
-    invoice_number = (NUM_RE.search(text).group(1).strip()
-                      if NUM_RE.search(text) else None)
+    # --- Champs simples ---
+    m_num = NUM_RE.search(text)
+    invoice_number = m_num.group(1).strip() if m_num else None
 
-    invoice_date = None
     m_date = DATE_RE.search(text)
+    invoice_date = None
     if m_date:
         try:
             invoice_date = dateparser.parse(m_date.group(1), dayfirst=True).date().isoformat()
         except Exception:
             invoice_date = None
 
-    total_ttc = _norm_amount(TOTAL_RE.search(text).group(1)) if TOTAL_RE.search(text) else None
+    # Totaux individuels
+    total_ht  = _norm_amount(TOTAL_HT_RE.search(text).group(1))  if TOTAL_HT_RE.search(text) else None
+    total_tva = _norm_amount(TVA_AMOUNT_RE.search(text).group(1)) if TVA_AMOUNT_RE.search(text) else None
+    total_ttc = _norm_amount(TOTAL_TTC_RE.search(text).group(1)) if TOTAL_TTC_RE.search(text) else None
+
+    # Fallback TTC si rien trouvé: prendre la plus “grosse” somme
     if total_ttc is None:
         amounts = [_norm_amount(a) for a in EUR_RE.findall(text)]
         amounts = [a for a in amounts if a is not None]
-        if amounts: total_ttc = max(amounts)
+        if amounts:
+            total_ttc = max(amounts)
 
     # Devise
     currency = None
@@ -285,14 +370,15 @@ def extract_pdf(path: str) -> Dict[str, Any]:
         vr = m_vat.group(1)
         vat_rate = '5.5' if vr in ('5,5', '5.5') else vr
 
+    # Résultat de base
     result: Dict[str, Any] = {
         "success": True,
         "meta": meta,
         "fields": {
             "invoice_number": invoice_number,
             "invoice_date":   invoice_date,
-            "total_ht":  None,
-            "total_tva": None,
+            "total_ht":  total_ht,
+            "total_tva": total_tva,
             "total_ttc": total_ttc,
             "currency":  currency or "EUR",
         },
@@ -301,70 +387,57 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # Seller / Buyer via blocs
+    # Vendeur / Client (blocs)
     m = SELLER_BLOCK.search(text)
-    if m: fields["seller"] = fields.get("seller") or _clean_block(m.group('blk'))
+    if m and not fields.get("seller"):
+        fields["seller"] = _clean_block(m.group('blk'))
+
     m = CLIENT_BLOCK.search(text)
-    if m: fields["buyer"] = fields.get("buyer") or _clean_block(m.group('blk'))
+    if m and not fields.get("buyer"):
+        fields["buyer"] = _clean_block(m.group('blk'))
 
-    # Si pas trouvé, heuristique par proximité dans les lignes
-    def _grab_block(after_keywords: List[str], stop_keywords: List[str]) -> Optional[str]:
-        ak = re.compile("|".join([re.escape(k) for k in after_keywords]), re.I)
-        sk = re.compile("|".join([re.escape(k) for k in stop_keywords]), re.I)
-        for i, ln in enumerate(lines):
-            if ak.search(ln):
-                buf = [ln]
-                for j in range(i+1, min(i+8, len(lines))):
-                    if sk.search(lines[j]): break
-                    if re.match(r'^(Réf|Ref|Designation|Désignation|Qté|Montant|Total)\b', lines[j], re.I): break
-                    buf.append(lines[j])
-                return _clean_block(" ".join(buf))
-        return None
-
-    if not fields.get("seller"):
-        blk = _grab_block(["Émetteur", "Vendeur", "Seller"], ["Client","Acheteur","Buyer"])
-        if blk: fields["seller"] = blk
-    if not fields.get("buyer"):
-        blk = _grab_block(["Client","Acheteur","Buyer","Bill to"], ["Émetteur","Vendeur","Seller"])
-        if blk: fields["buyer"] = blk
-
-    # Identifiants FR & IBAN (vendeur)
+    # Identifiants FR (vendeur)
     m = TVA_RE.search(text)
-    if m and not fields.get("seller_tva"): fields["seller_tva"] = m.group(0).replace(' ', '')
+    if m and not fields.get("seller_tva"):
+        fields["seller_tva"] = m.group(0).replace(' ', '')
+
     m = SIRET_RE.search(text)
-    if m and not fields.get("seller_siret"): fields["seller_siret"] = m.group(0)
+    if m and not fields.get("seller_siret"):
+        fields["seller_siret"] = m.group(0)
     elif not fields.get("seller_siret"):
         m2 = SIREN_RE.search(text)
-        if m2: fields["seller_siret"] = m2.group(0)
+        if m2:
+            fields["seller_siret"] = m2.group(0)
+
     m = IBAN_RE.search(text)
-    if m and not fields.get("seller_iban"): fields["seller_iban"] = m.group(0).replace(' ', '')
+    if m and not fields.get("seller_iban"):
+        fields["seller_iban"] = m.group(0).replace(' ', '')
 
-    # -------- LIGNES D'ARTICLES --------
-    # 1) pdfplumber (si dispo)
-    article_lines: List[Dict[str, Any]] = []
+    # Lignes d'articles
+    lines: List[Dict[str, Any]] = []
+    # 1) tableau structuré si pdfplumber dispo
     try:
-        article_lines = _parse_lines_with_pdfplumber(str(p))
+        lines = _parse_lines_with_pdfplumber(str(p))
     except Exception:
-        article_lines = []
-    # 2) texte: une seule ligne
-    if not article_lines:
-        article_lines = _parse_lines_text_one_line(text)
-    # 3) texte: multi-lignes autour de “ref — label” + “qty PU montant”
-    if not article_lines:
-        article_lines = _parse_lines_text_multiline(lines)
+        lines = []
+    # 2) fallback bloc si rien
+    if not lines:
+        lines = _parse_lines_blockwise(text)
 
-    if article_lines:
-        result["lines"] = article_lines
-        fields["lines_count"] = len(article_lines)
+    if lines:
+        result["lines"] = lines
+        fields["lines_count"] = len(lines)
 
-        sum_lines = round(sum((r.get("amount") or 0.0) for r in article_lines), 2)
-        if total_ttc and _approx(sum_lines, total_ttc, 1.5):
-            th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
-            fields["total_ht"], fields["total_tva"], fields["total_ttc"] = th, tv, tt or total_ttc
-        else:
-            th, tv, tt = _infer_totals(total_ttc, sum_lines or None, None, vat_rate)
-            if th is not None: fields["total_ht"] = th
-            if tv is not None: fields["total_tva"] = tv
-            if tt is not None: fields["total_ttc"] = tt
+        # Si totaux manquants, essayer d'inférer
+        # somme des montants de lignes (qu'on suppose HT en général)
+        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
+
+        if fields.get("total_ht") is None and sum_lines:
+            fields["total_ht"] = sum_lines
+
+        ht, tv, tt = _infer_totals(fields.get("total_ttc"), fields.get("total_ht"), fields.get("total_tva"), vat_rate)
+        if ht is not None: fields["total_ht"]  = ht
+        if tv is not None: fields["total_tva"] = tv
+        if tt is not None: fields["total_ttc"] = tt
 
     return result
