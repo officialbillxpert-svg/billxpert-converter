@@ -3,7 +3,13 @@ from pdfminer.high_level import extract_text
 from dateutil import parser as dateparser
 from pathlib import Path
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
+
+# import "safe" de pdfplumber
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
 
 # --- Regex de base ---
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
@@ -207,6 +213,103 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
 
+    # --- Détection des entêtes de tableau ---
+TABLE_HEADER_HINTS = [
+    ("ref", "réf", "reference", "code"),
+    ("désignation", "designation", "libellé", "description", "label"),
+    ("qté", "qte", "qty", "quantité"),
+    ("pu", "prix unitaire", "unit price"),
+    ("montant", "total", "amount")
+]
+
+def _norm_header_cell(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("é","e").replace("è","e").replace("ê","e").replace("à","a").replace("û","u").replace("ï","i")
+    s = s.replace("\n"," ").replace("\t"," ")
+    s = re.sub(r"\s+"," ", s)
+    return s
+
+def _map_header_indices(headers: List[str]):
+    idx = {}
+    norm = [_norm_header_cell(h) for h in headers]
+    def match_one(*cands):
+        for i, h in enumerate(norm):
+            for c in cands:
+                if c in h:
+                    return i
+        return None
+    idx["ref"]    = match_one(*TABLE_HEADER_HINTS[0])
+    idx["label"]  = match_one(*TABLE_HEADER_HINTS[1])
+    idx["qty"]    = match_one(*TABLE_HEADER_HINTS[2])
+    idx["unit"]   = match_one(*TABLE_HEADER_HINTS[3])
+    idx["amount"] = match_one(*TABLE_HEADER_HINTS[4])
+    if all(v is None for v in idx.values()):
+        return None
+    return idx
+
+def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
+    """Tente d’extraire un tableau d’articles avec pdfplumber. Fallback vide si non installé."""
+    if pdfplumber is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = []
+                t = page.extract_table()
+                if t: tables.append(t)
+                t2 = page.extract_table({"vertical_strategy":"lines", "horizontal_strategy":"lines"})
+                if t2: tables.append(t2)
+
+                for tbl in tables:
+                    tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
+                    if not tbl or len(tbl) < 2: 
+                        continue
+
+                    header = tbl[0]
+                    idx = _map_header_indices(header)
+                    if not idx:
+                        continue
+
+                    for line in tbl[1:]:
+                        def get(i): 
+                            return line[i] if (i is not None and i < len(line)) else ""
+                        ref   = get(idx["ref"])
+                        label = get(idx["label"]) or ref
+                        qty   = get(idx["qty"])
+                        pu    = get(idx["unit"])
+                        amt   = get(idx["amount"])
+
+                        try:
+                            qty = int(re.sub(r"[^\d]", "", qty)) if qty else None
+                        except Exception:
+                            qty = None
+
+                        pu_f  = _norm_amount(pu)
+                        amt_f = _norm_amount(amt)
+
+                        if not (label or pu_f is not None or amt_f is not None):
+                            continue
+
+                        rows.append({
+                            "ref":        (ref or "").strip() or None,
+                            "label":      (label or "").strip(),
+                            "qty":        qty,
+                            "unit_price": pu_f,
+                            "amount":     amt_f
+                        })
+        # dédoublonnage rapide
+        uniq, seen = [], set()
+        for r in rows:
+            key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
+            if key in seen: 
+                continue
+            seen.add(key)
+            uniq.append(r)
+        return uniq
+    except Exception:
+        return []
+        
     # --- Lignes d'articles ---
     # 1) Essayer tableau structuré (pdfplumber)
     lines = _parse_lines_with_pdfplumber(str(p))
