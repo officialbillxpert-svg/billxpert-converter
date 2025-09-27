@@ -129,7 +129,7 @@ def extract_pdf(path: str) -> Dict[str, Any]:
         "filename": p.name,
     }
 
-    # Champs simples
+    # --- Champs simples ---
     m_num = NUM_RE.search(text)
     invoice_number = m_num.group(1).strip() if m_num else None
 
@@ -144,27 +144,27 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     m_total = TOTAL_RE.search(text)
     total_ttc = _norm_amount(m_total.group(1)) if m_total else None
     if total_ttc is None:
-        # fallback: grosse somme
+        # fallback: prendre la plus grande somme plausiblement monétaire
         amounts = [_norm_amount(a) for a in EUR_RE.findall(text)]
         amounts = [a for a in amounts if a is not None]
         if amounts:
             total_ttc = max(amounts)
 
-    # Devise
+    # --- Devise ---
     currency = None
     if re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
     elif re.search(r"\bGBP\b|£", text, re.I): currency = "GBP"
     elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
     elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
 
-    # Taux TVA
+    # --- Taux TVA ---
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
     if m_vat:
         vr = m_vat.group(1)
-        vat_rate = '5.5' if vr in ('5,5', '5.5') else vr  # uniformiser 5,5 → 5.5
+        vat_rate = '5.5' if vr in ('5,5', '5.5') else vr
 
-    # Résultat initial
+    # --- Résultat initial ---
     result: Dict[str, Any] = {
         "success": True,
         "meta": meta,
@@ -181,7 +181,7 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # Vendeur / Client (blocs)
+    # --- Vendeur / Client (blocs) ---
     m = SELLER_BLOCK.search(text)
     if m and not fields.get("seller"):
         fields["seller"] = _clean_block(m.group('blk'))
@@ -190,7 +190,7 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     if m and not fields.get("buyer"):
         fields["buyer"] = _clean_block(m.group('blk'))
 
-    # Identifiants FR (vendeur)
+    # --- Identifiants FR (vendeur) ---
     m = TVA_RE.search(text)
     if m and not fields.get("seller_tva"):
         fields["seller_tva"] = m.group(0).replace(' ', '')
@@ -207,28 +207,31 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
 
-    # Lignes d'articles
-    lines = _parse_lines(text)
+    # --- Lignes d'articles ---
+    # 1) Essayer tableau structuré (pdfplumber)
+    lines = _parse_lines_with_pdfplumber(str(p))
+    # 2) Fallback regex sur texte brut si rien trouvé
+    if not lines:
+        lines = _parse_lines(text)
+
     if lines:
         result["lines"] = lines
         fields["lines_count"] = len(lines)
 
-        # Somme des montants des lignes
-        sum_lines = round(sum([(r.get("amount") or 0.0) for r in lines]), 2)
+        # Somme des montants lignes
+        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
 
-        # On décide si les montants de lignes sont HT ou TTC :
-        # - si sum_lines ~ total_ttc → on considère que c'est TTC
-        # - sinon on les traite comme HT
-        if total_ttc and _approx(sum_lines, total_ttc, tol=1.5):
-            # lignes = TTC → calcule HT/TVA à partir de TTC
+        # Décider si lignes = TTC ou HT (heuristique)
+        if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
+            # lignes ≈ TTC → compléter HT/TVA depuis TTC
             total_ht, total_tva, total_ttc2 = _infer_totals(total_ttc, None, None, vat_rate)
             fields["total_ht"]  = total_ht
             fields["total_tva"] = total_tva
             fields["total_ttc"] = total_ttc2 or total_ttc
         else:
-            # lignes = HT (cas le plus courant)
-            total_ht = sum_lines if sum_lines else None
-            th, tv, tt = _infer_totals(total_ttc, total_ht, None, vat_rate)
+            # Sinon considérer lignes = HT et compléter si possible
+            total_ht = sum_lines if sum_lines else fields.get("total_ht")
+            th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
             if th is not None: fields["total_ht"]  = th
             if tv is not None: fields["total_tva"] = tv
             if tt is not None: fields["total_ttc"] = tt
