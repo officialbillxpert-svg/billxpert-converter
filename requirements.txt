@@ -4,3 +4,4 @@ gunicorn==22.0.0
 pdfminer.six==20231228
 pikepdf==9.4.2
 python-dateutil==2.9.0.post0
+pdfplumber>=0.11.3
