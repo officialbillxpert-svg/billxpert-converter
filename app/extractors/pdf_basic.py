@@ -1,25 +1,32 @@
+# app/extractors/pdf_basic.py
+from __future__ import annotations
 from pathlib import Path
-import re
 from typing import Optional, Dict, Any, List, Tuple
-from dateutil import parser as dateparser
-from pdfminer.high_level import extract_text
+import re
 
-# pdfplumber est optionnel
+# --- deps d'extraction ---
+from pdfminer.high_level import extract_text as pdfminer_extract_text
+
+# pdfplumber est optionnel mais recommandé
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None
 
-# ---------- Regex de base ----------
+from dateutil import parser as dateparser
+
+
+# =========================
+#        REGEX de base
+# =========================
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
 
-# Totaux: on capture plutôt les lignes nommées pour éviter de prendre n’importe quelle somme
-TOTAL_HT_RE  = re.compile(r'(?:Total\s*HT|Sous-?total)\s*[:€]*\s*([0-9][0-9\.\,\s]+)', re.I)
-TOTAL_TVA_RE = re.compile(r'(?:TVA(?:\s*\(\s*\d+[.,]?\d*\s*%\s*\))?)\s*[:€]*\s*([0-9][0-9\.\,\s]+)', re.I)
-TOTAL_TTC_RE = re.compile(r'(?:Total\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)', re.I)
+# Totaux – on matche plusieurs formulations, FR & EN
+TOTAL_TTC_RE = re.compile(r'(?:Total\s*(?:TTC)?|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*:?\s*([0-9][0-9\.\,\s]+)', re.I)
+TOTAL_HT_RE  = re.compile(r'(?:Total\s*HT|Sous-?total|Sub\s*total)\s*:?\s*([0-9][0-9\.\,\s]+)', re.I)
+TOTAL_TVA_RE = re.compile(r'(?:TVA|VAT)\s*\(?\s*\d+(?:[.,]\d+)?%\s*\)?\s*:?\s*([0-9][0-9\.\,\s]+)', re.I)
 
-# fallback montants
 EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)')
 
 # Identifiants FR
@@ -29,16 +36,11 @@ TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
 IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
 
 # Blocs parties
-SELLER_BLOCK = re.compile(
-    r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)',
-    re.I | re.S
-)
-CLIENT_BLOCK = re.compile(
-    r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)',
-    re.I | re.S
-)
+SELLER_BLOCK = re.compile(r'(?:Émetteur|Vendeur|Seller|From)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer|Bill(?:ed)?\s*to|To)', re.I | re.S)
+CLIENT_BLOCK = re.compile(r'(?:Client|Acheteur|Buyer|Bill(?:ed)?\s*to|To)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller|From)', re.I | re.S)
 
-# Lignes “tout sur la même ligne”
+# Lignes (fallback texte – quand pas d’en-tête trouvée)
+# Ex: "PREST-001 — Libellé ...  12  10,00 €  120,00 €"
 LINE_RX = re.compile(
     r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
     r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
@@ -46,21 +48,16 @@ LINE_RX = re.compile(
 )
 
 # Taux TVA
-VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
+VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(\d{1,2}(?:[.,]\d{1,2})?)\s*%?', re.I)
 
-# En-têtes possibles
-TABLE_HEADER_HINTS = {
-    "label": ("réf", "ref", "reference", "code", "désignation", "designation", "libellé", "description", "label"),
-    "qty":   ("qté", "qte", "qty", "quantité", "quantite"),
-    "unit":  ("pu", "prix unitaire", "unit price", "price"),
-    "amt":   ("montant", "total", "amount")
-}
 
-# ---------- Helpers ----------
+# =========================
+#         Helpers
+# =========================
 def _norm_amount(s: str) -> Optional[float]:
     if not s:
         return None
-    s = s.strip().replace(' ', '')
+    s = s.strip().replace('\u202f', '').replace(' ', '')
     if ',' in s and '.' in s:
         s = s.replace('.', '').replace(',', '.')
     elif ',' in s:
@@ -80,21 +77,24 @@ def _approx(a: Optional[float], b: Optional[float], tol: float = 1.0) -> bool:
     return abs(a - b) <= tol
 
 def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Complète HT/TVA/TTC si on connaît un taux (ex: 20 -> 0.20)."""
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
 
     ht, tva, ttc = total_ht, total_tva, total_ttc
 
+    # Cas 1 : seulement TTC connu
     if ttc is not None and (ht is None or tva is None):
         try:
-            ht_calc = round(ttc / (1.0 + rate), 2)
+            ht_calc  = round(ttc / (1.0 + rate), 2)
             tva_calc = round(ttc - ht_calc, 2)
-            if ht is None:  ht = ht_calc
+            if ht  is None: ht  = ht_calc
             if tva is None: tva = tva_calc
         except Exception:
             pass
 
+    # Cas 2 : HT connu
     if ht is not None and (ttc is None or tva is None):
         try:
             tva_calc = round(ht * rate, 2)
@@ -104,6 +104,7 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
         except Exception:
             pass
 
+    # Cas 3 : TTC + TVA connus -> calc HT
     if ttc is not None and tva is not None and ht is None:
         try:
             ht = round(ttc - tva, 2)
@@ -112,183 +113,183 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
 
     return ht, tva, ttc
 
-# ---------- Parsing lignes ----------
-def _parse_lines_singleline(text: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for m in LINE_RX.finditer(text):
-        qty = int(m.group('qty'))
-        pu  = _norm_amount(m.group('pu'))
-        amt = _norm_amount(m.group('amt'))
-        rows.append({
-            "ref":        m.group('ref'),
-            "label":      m.group('label').strip(),
+
+# =========================
+#   pdfplumber – tables
+# =========================
+TABLE_HEADER_HINTS = {
+    "ref":    ("ref", "réf", "reference", "code", "item"),
+    "label":  ("désignation", "designation", "libellé", "description", "label", "item description"),
+    "qty":    ("qté", "qte", "qty", "quantité", "quantity"),
+    "unit":   ("pu", "prix unitaire", "unit price", "price", "unit"),
+    "amount": ("montant", "total", "amount", "line total")
+}
+
+def _norm_header_cell(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = (s.replace("é","e").replace("è","e").replace("ê","e")
+           .replace("à","a").replace("û","u").replace("ï","i"))
+    s = s.replace("\n"," ").replace("\t"," ")
+    s = re.sub(r"\s+"," ", s)
+    return s
+
+def _role_of_header(text: str) -> Optional[str]:
+    t = _norm_header_cell(text)
+    for role, alts in TABLE_HEADER_HINTS.items():
+        if any(a in t for a in alts):
+            return role
+    return None
+
+def _find_header_line(words: List[Dict[str, Any]], y_tol: float = 4.0) -> Optional[Tuple[float, Dict[str, float]]]:
+    """
+    Trouve la ligne d’en-tête en groupant les mots par Y, puis en
+    détectant des libellés connus. Retourne (y_header, {role: x_center})
+    """
+    if not words:
+        return None
+    # groupe par Y (lignes)
+    rows_map: Dict[int, List[Dict[str, Any]]] = {}
+    ys_sorted = sorted(set(round(w["top"], 1) for w in words))
+    def _closest_row(y):
+        for i, ry in enumerate(ys_sorted):
+            if abs(ry - y) <= y_tol:
+                return i
+        ys_sorted.append(round(y,1))
+        return len(ys_sorted)-1
+
+    for w in words:
+        i = _closest_row(w["top"])
+        rows_map.setdefault(i, []).append(w)
+
+    # pour chaque "ligne", tenter de détecter des headers
+    best = None
+    for i, ws in rows_map.items():
+        roles = {}
+        for w in ws:
+            role = _role_of_header(w.get("text",""))
+            if role and role not in roles:
+                # centre X de ce header
+                x_center = (w["x0"] + w["x1"]) / 2.0
+                roles[role] = x_center
+        # on considère une en-tête valide si >= 2 rôles trouvés
+        if len(roles) >= 2:
+            y_vals = [w["top"] for w in ws]
+            y_header = sum(y_vals)/len(y_vals)
+            # ordonner roles par x croissant
+            roles = dict(sorted(roles.items(), key=lambda kv: kv[1]))
+            best = (y_header, roles)
+            break
+    return best
+
+def _cluster_rows(words: List[Dict[str, Any]], start_y: float, y_tol: float = 4.0) -> List[List[Dict[str, Any]]]:
+    """
+    Prend les mots situés sous start_y et groupe par lignes (Y proches).
+    """
+    below = [w for w in words if w["top"] > start_y + 0.5]
+    below.sort(key=lambda w: (w["top"], w["x0"]))
+    lines: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    last_top = None
+
+    for w in below:
+        if last_top is None or abs(w["top"] - last_top) <= y_tol:
+            current.append(w)
+            last_top = w["top"] if last_top is None else (last_top + w["top"]) / 2.0
+        else:
+            if current:
+                lines.append(current)
+            current = [w]
+            last_top = w["top"]
+
+    if current:
+        lines.append(current)
+    return lines
+
+def _assign_to_columns(line_words: List[Dict[str, Any]], roles_x: Dict[str, float]) -> Dict[str, str]:
+    """
+    Pour une ligne (liste de mots), assigne chaque mot à la colonne dont le X est le plus proche.
+    Concatène les mots par colonne.
+    """
+    cols: Dict[str, List[str]] = {r: [] for r in roles_x.keys()}
+    for w in line_words:
+        x_center = (w["x0"] + w["x1"]) / 2.0
+        # colonne la plus proche
+        role = min(roles_x.keys(), key=lambda r: abs(roles_x[r] - x_center))
+        cols[role].append(w["text"])
+    # joindre
+    return {r: " ".join(cols[r]).strip() if cols[r] else "" for r in cols}
+
+def _to_int(s: str) -> Optional[int]:
+    try:
+        if not s: return None
+        s2 = re.sub(r"[^\d-]", "", s)
+        return int(s2) if s2 not in ("", "-", None) else None
+    except Exception:
+        return None
+
+def _parse_lines_with_words(page, y_header: float, roles_x: Dict[str, float]) -> List[Dict[str, Any]]:
+    """Construit les lignes d’articles à partir des mots et des colonnes détectées."""
+    all_words = page.extract_words(extra_attrs=["x0","x1","top","bottom"])
+    rows = _cluster_rows(all_words, start_y=y_header, y_tol=4.0)
+
+    out: List[Dict[str, Any]] = []
+    for rw in rows:
+        cols = _assign_to_columns(rw, roles_x)
+        ref   = cols.get("ref") or None
+        label = cols.get("label") or ref or ""
+        qty   = _to_int(cols.get("qty",""))
+        pu    = _norm_amount(cols.get("unit",""))
+        amt   = _norm_amount(cols.get("amount",""))
+
+        # ignorer les balises "Total", "TVA", etc.
+        row_text = " ".join(w["text"] for w in rw).lower()
+        if any(k in row_text for k in ("total ht", "total ttc", "tva", "grand total")):
+            continue
+
+        # ignorer lignes vides
+        if not label and pu is None and amt is None and qty is None:
+            continue
+
+        out.append({
+            "ref":        ref,
+            "label":      label,
             "qty":        qty,
             "unit_price": pu,
             "amount":     amt
         })
-    return rows
+    # nettoyage doublons
+    uniq, seen = [], set()
+    for r in out:
+        key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+    return uniq
 
-def _find_header_line_idx(lines: List[str], candidates: Tuple[str, ...]) -> Optional[int]:
-    for i, raw in enumerate(lines):
-        s = raw.strip().lower()
-        s = (s.replace("é","e").replace("è","e").replace("ê","e")
-               .replace("à","a").replace("û","u").replace("ï","i"))
-        for c in candidates:
-            if c in s:
-                return i
-    return None
 
-def _collect_column_values(lines: List[str], start_idx: int) -> List[str]:
-    """Collecte les valeurs sous un en-tête jusqu’à un séparateur (ligne vide, 'total', 'merci', etc.)."""
-    vals: List[str] = []
-    for raw in lines[start_idx+1:]:
-        s = raw.strip()
-        if not s:
-            break
-        low = s.lower()
-        if low.startswith("total") or "merci" in low or "conditions" in low:
-            break
-        vals.append(s)
-    return vals
-
-def _parse_lines_columns(text: str) -> List[Dict[str, Any]]:
-    """
-    Fallback pour le cas où les colonnes sont verticales :
-    - bloc ‘Réf / Désignation’ (ou équivalent) listé,
-    - plus bas bloc ‘Qté’,
-    - plus bas bloc ‘PU’,
-    - plus bas bloc ‘Montant’.
-    """
-    lines = [l for l in text.splitlines()]
-
-    idx_label = _find_header_line_idx(lines, TABLE_HEADER_HINTS["label"])
-    idx_qty   = _find_header_line_idx(lines, TABLE_HEADER_HINTS["qty"])
-    idx_unit  = _find_header_line_idx(lines, TABLE_HEADER_HINTS["unit"])
-    idx_amt   = _find_header_line_idx(lines, TABLE_HEADER_HINTS["amt"])
-
-    # On a besoin a minima d’un bloc label + au moins un des autres
-    if idx_label is None:
-        return []
-
-    labels  = _collect_column_values(lines, idx_label)
-    qtys    = _collect_column_values(lines, idx_qty) if idx_qty is not None else []
-    units   = _collect_column_values(lines, idx_unit) if idx_unit is not None else []
-    amounts = _collect_column_values(lines, idx_amt) if idx_amt is not None else []
-
-    n = len(labels)
-    if n == 0:
-        return []
-
-    # normalisations
-    def to_int_safe(s: str) -> Optional[int]:
-        if not s: return None
-        m = re.search(r'\d+', s.replace(' ', ''))
-        return int(m.group(0)) if m else None
-
-    rows: List[Dict[str, Any]] = []
-    for i in range(n):
-        label = labels[i].strip()
-        # si le label contient "—" on split en ref + libellé (cas "PREST-001 — Dev")
-        ref = None
-        if '—' in label:
-            parts = [p.strip() for p in label.split('—', 1)]
-            if len(parts) == 2:
-                ref, label = parts[0], parts[1]
-
-        qty  = to_int_safe(qtys[i]) if i < len(qtys) else None
-        pu   = _norm_amount(units[i]) if i < len(units) else None
-        amt  = _norm_amount(amounts[i]) if i < len(amounts) else None
-
-        rows.append({
-            "ref": ref or label,
-            "label": label,
-            "qty": qty,
-            "unit_price": pu,
-            "amount": amt
-        })
-
-    return rows
-
-def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
-    if pdfplumber is None:
-        return []
-    rows: List[Dict[str, Any]] = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                # essaye deux stratégies
-                for cfg in (None, {"vertical_strategy":"lines","horizontal_strategy":"lines"}):
-                    t = page.extract_table(cfg) if cfg else page.extract_table()
-                    if not t:
-                        continue
-                    table = [[(c or "").strip() for c in (row or [])] for row in t if any((row or []))]
-                    if len(table) < 2:
-                        continue
-                    header = [h.strip().lower() for h in table[0]]
-                    # trouve des index “proches”
-                    def find_idx(keys: Tuple[str, ...]) -> Optional[int]:
-                        for i, h in enumerate(header):
-                            hl = h.replace("é","e").replace("è","e").replace("ê","e").replace("à","a")
-                            for k in keys:
-                                if k in hl:
-                                    return i
-                        return None
-                    i_label = find_idx(TABLE_HEADER_HINTS["label"])
-                    i_qty   = find_idx(TABLE_HEADER_HINTS["qty"])
-                    i_unit  = find_idx(TABLE_HEADER_HINTS["unit"])
-                    i_amt   = find_idx(TABLE_HEADER_HINTS["amt"])
-                    if i_label is None:
-                        continue
-                    for line in table[1:]:
-                        def get(i): return line[i] if (i is not None and i < len(line)) else ""
-                        label = get(i_label)
-                        qty   = get(i_qty)
-                        unit  = get(i_unit)
-                        amt   = get(i_amt)
-
-                        ref = None
-                        if '—' in label:
-                            parts = [p.strip() for p in label.split('—',1)]
-                            if len(parts)==2:
-                                ref, label = parts[0], parts[1]
-
-                        try:
-                            qty_i = int(re.search(r'\d+', qty.replace(' ', '')).group(0)) if qty else None
-                        except Exception:
-                            qty_i = None
-                        rows.append({
-                            "ref": ref or (label or None),
-                            "label": label or None,
-                            "qty": qty_i,
-                            "unit_price": _norm_amount(unit),
-                            "amount": _norm_amount(amt)
-                        })
-        # dédoublonnage simple
-        uniq, seen = [], set()
-        for r in rows:
-            key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
-            if key in seen: 
-                continue
-            seen.add(key)
-            uniq.append(r)
-        return uniq
-    except Exception:
-        return []
-
-# ---------- Extraction principale ----------
+# =========================
+#  Extraction principale
+# =========================
 def extract_pdf(path: str) -> Dict[str, Any]:
     p = Path(path)
-    text = extract_text(p) or ""
+
+    # 1) Texte brut (utile pour regex + blocs parties)
+    text = ""
+    try:
+        text = pdfminer_extract_text(p) or ""
+    except Exception:
+        text = ""
 
     meta = {
         "bytes": p.stat().st_size if p.exists() else None,
-        "pages": (text.count("\f") + 1) if text else 0,
+        "pages": text.count("\f") + 1 if text else 0,
         "filename": p.name,
     }
 
-    # Numéro & date
+    # --- Champs simples ---
     m_num = NUM_RE.search(text)
-    invoice_number = m_num.group(1).strip() if m_num else None
+    invoice_number = (m_num.group(1).strip() if m_num else None) or None
 
     m_date = DATE_RE.search(text)
     invoice_date = None
@@ -298,108 +299,131 @@ def extract_pdf(path: str) -> Dict[str, Any]:
         except Exception:
             invoice_date = None
 
-    # Totaux (priorité aux lignes nommées)
-    total_ht  = None
-    total_tva = None
-    total_ttc = None
+    # Totaux par libellés (si présents tels quels)
+    total_ht  = _norm_amount((TOTAL_HT_RE.search(text)  or [None, None])[1]) if TOTAL_HT_RE.search(text)  else None
+    total_tva = _norm_amount((TOTAL_TVA_RE.search(text) or [None, None])[1]) if TOTAL_TVA_RE.search(text) else None
+    total_ttc = _norm_amount((TOTAL_TTC_RE.search(text) or [None, None])[1]) if TOTAL_TTC_RE.search(text) else None
 
-    m = TOTAL_HT_RE.search(text)
-    if m: total_ht = _norm_amount(m.group(1))
-    m = TOTAL_TVA_RE.search(text)
-    if m: total_tva = _norm_amount(m.group(1))
-    m = TOTAL_TTC_RE.search(text)
-    if m: total_ttc = _norm_amount(m.group(1))
-
-    # fallback TTC si rien
+    # fallback TTC si rien trouvé: prendre la plus grande somme plausible
     if total_ttc is None:
-        amounts = [_norm_amount(a) for a in EUR_RE.findall(text)]
-        amounts = [a for a in amounts if a is not None]
-        if amounts:
-            total_ttc = max(amounts)
+        amts = [_norm_amount(a) for a in EUR_RE.findall(text)]
+        amts = [a for a in amts if a is not None]
+        if amts:
+            total_ttc = max(amts)
 
     # Devise
-    currency = "EUR"
-    if re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
+    currency = None
+    if re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
     elif re.search(r"\bGBP\b|£", text, re.I): currency = "GBP"
     elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
-    elif re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
+    elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
 
-    # Taux TVA
+    # Taux TVA (pour compléter si nécessaire)
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
     if m_vat:
-        vr = m_vat.group(1)
-        vat_rate = '5.5' if vr in ('5,5', '5.5') else vr
+        vat_rate = m_vat.group(1).replace(',', '.')
 
-    # Base résultat
+    # Parties
+    seller = None
+    buyer  = None
+    m = SELLER_BLOCK.search(text)
+    if m: seller = _clean_block(m.group('blk'))
+    m = CLIENT_BLOCK.search(text)
+    if m: buyer = _clean_block(m.group('blk'))
+
+    # IDs FR
+    seller_tva = None
+    seller_siret = None
+    seller_iban = None
+
+    m = TVA_RE.search(text)
+    if m: seller_tva = m.group(0).replace(' ', '')
+    m = SIRET_RE.search(text)
+    if m: seller_siret = m.group(0)
+    else:
+        m2 = SIREN_RE.search(text)
+        if m2: seller_siret = m2.group(0)
+    m = IBAN_RE.search(text)
+    if m: seller_iban = m.group(0).replace(' ', '')
+
+    # 2) Lignes d’articles via pdfplumber (premium)
+    lines: List[Dict[str, Any]] = []
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(str(p)) as pdf:
+                for page in pdf.pages:
+                    words = page.extract_words(extra_attrs=["x0","x1","top","bottom"])
+                    hdr = _find_header_line(words, y_tol=4.0)
+                    if not hdr:
+                        continue
+                    y_header, roles_x = hdr
+                    page_lines = _parse_lines_with_words(page, y_header, roles_x)
+                    if page_lines:
+                        lines.extend(page_lines)
+        except Exception:
+            # on reste silencieux et on bascule fallback texte
+            pass
+
+    # 3) Fallback lignes via regex (si rien trouvé)
+    if not lines:
+        for m in LINE_RX.finditer(text):
+            qty = int(m.group('qty'))
+            pu  = _norm_amount(m.group('pu'))
+            amt = _norm_amount(m.group('amt'))
+            lines.append({
+                "ref":        m.group('ref'),
+                "label":      m.group('label').strip(),
+                "qty":        qty,
+                "unit_price": pu,
+                "amount":     amt
+            })
+
+    # 4) Compléter HT/TVA/TTC si possible à partir des lignes ou du taux
+    if lines:
+        # Si les montants de lignes existent, on somme
+        sum_amounts = sum([(r.get("amount") or 0.0) for r in lines])
+        sum_amounts = round(sum_amounts, 2) if sum_amounts else None
+
+        if sum_amounts and total_ttc and _approx(sum_amounts, total_ttc, tol=1.5):
+            # lignes ≈ TTC
+            if total_ht is None or total_tva is None:
+                ht, tva, ttc = _infer_totals(total_ttc, None, None, vat_rate)
+                total_ht  = total_ht  or ht
+                total_tva = total_tva or tva
+                total_ttc = total_ttc or ttc
+        else:
+            # considérer que lignes = HT (cas fréquent)
+            if sum_amounts and total_ht is None:
+                total_ht = sum_amounts
+            if (total_ht is not None) and (total_ttc is None or total_tva is None):
+                ht, tva, ttc = _infer_totals(total_ttc, total_ht, total_tva, vat_rate)
+                total_ht  = ht  if total_ht is None else total_ht
+                total_tva = tva if total_tva is None else total_tva
+                total_ttc = ttc if total_ttc is None else total_ttc
+
+    # 5) Résultat
     result: Dict[str, Any] = {
         "success": True,
         "meta": meta,
         "fields": {
-            "invoice_number": invoice_number,
+            "invoice_number": invoice_number or None,
             "invoice_date":   invoice_date,
             "total_ht":  total_ht,
             "total_tva": total_tva,
             "total_ttc": total_ttc,
-            "currency":  currency,
+            "currency":  currency or "EUR",
+            "seller":    seller,
+            "buyer":     buyer,
+            "seller_tva":   seller_tva,
+            "seller_siret": seller_siret,
+            "seller_iban":  seller_iban,
+            "lines_count": len(lines) if lines else None,
         },
         "text": text[:20000],
         "text_preview": text[:2000],
     }
-    fields = result["fields"]
-
-    # Seller / Buyer
-    m = SELLER_BLOCK.search(text)
-    if m and not fields.get("seller"):
-        fields["seller"] = _clean_block(m.group('blk'))
-    m = CLIENT_BLOCK.search(text)
-    if m and not fields.get("buyer"):
-        fields["buyer"] = _clean_block(m.group('blk'))
-
-    # Identifiants vendeur
-    m = TVA_RE.search(text)
-    if m and not fields.get("seller_tva"):
-        fields["seller_tva"] = m.group(0).replace(' ', '')
-    m = SIRET_RE.search(text)
-    if m and not fields.get("seller_siret"):
-        fields["seller_siret"] = m.group(0)
-    elif not fields.get("seller_siret"):
-        m2 = SIREN_RE.search(text)
-        if m2:
-            fields["seller_siret"] = m2.group(0)
-    m = IBAN_RE.search(text)
-    if m and not fields.get("seller_iban"):
-        fields["seller_iban"] = m.group(0).replace(' ', '')
-
-    # Lignes d’articles : pdfplumber → singleline → colonnes
-    lines: List[Dict[str, Any]] = []
-    try:
-        lines = _parse_lines_with_pdfplumber(str(p))
-    except Exception:
-        lines = []
-    if not lines:
-        lines = _parse_lines_singleline(text)
-    if not lines:
-        lines = _parse_lines_columns(text)
-
     if lines:
         result["lines"] = lines
-        fields["lines_count"] = len(lines)
-
-        # Si HT/TVA manquants, on tente depuis lignes + taux
-        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
-        if sum_lines and total_ttc and _approx(sum_lines, total_ttc, tol=1.5):
-            h, t, tt = _infer_totals(total_ttc, None, None, vat_rate)
-            fields["total_ht"]  = fields.get("total_ht")  or h
-            fields["total_tva"] = fields.get("total_tva") or t
-            fields["total_ttc"] = fields.get("total_ttc") or tt or total_ttc
-        else:
-            # suppose les montants-lignes = HT si cohérent
-            if sum_lines and fields.get("total_ht") is None:
-                fields["total_ht"] = sum_lines
-            h, t, tt = _infer_totals(fields.get("total_ttc"), fields.get("total_ht"), fields.get("total_tva"), vat_rate)
-            fields["total_ht"]  = fields.get("total_ht")  or h
-            fields["total_tva"] = fields.get("total_tva") or t
-            fields["total_ttc"] = fields.get("total_ttc") or tt
 
     return result
