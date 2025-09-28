@@ -1,18 +1,14 @@
-from flask import Flask, request, jsonify, send_file, render_template_string, Response
+# app/main.py
+from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
-import tempfile, os, io, csv, shutil, json
-from typing import Dict, Any
+import tempfile, os, io, csv, shutil
 
 # Imports projet
 from .extractors.pdf_basic import extract_pdf
-from .extractors.summary import summarize_from_text  # summarize_from_csv pas utilisé ici
+from .extractors.summary import summarize_from_text  # utilisé pour combler si besoin
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-
-# Limite de taille (10 Mo) + JSON pour 413
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
+CORS(app)
 
 HTML_FORM = """
 <!doctype html><meta charset="utf-8">
@@ -20,47 +16,18 @@ HTML_FORM = """
 <h1>BillXpert Converter — Test</h1>
 <form method="post" action="/api/convert.csv" enctype="multipart/form-data">
   <input type="file" name="file" accept="application/pdf" required>
-  <button type="submit">Exporter CSV</button>
+  <button type="submit">Exporter CSV (résumé)</button>
 </form>
 <p style="margin-top:12px">Ou test JSON :</p>
 <form method="post" action="/api/convert" enctype="multipart/form-data">
   <input type="file" name="file" accept="application/pdf" required>
-  <button type="submit">Voir JSON</button>
-</form>
-<p style="margin-top:12px">Résumé :</p>
-<form method="post" action="/api/summary" enctype="multipart/form-data">
-  <input type="file" name="file" accept="application/pdf" required>
-  <button type="submit">Voir résumé (JSON)</button>
+  <button type="submit">Voir JSON (complet)</button>
 </form>
 """
 
 @app.get("/")
 def home():
     return render_template_string(HTML_FORM)
-
-# ---------------------------------------------------------------------------
-# Utilitaires de réponses JSON d’erreur uniformes
-# ---------------------------------------------------------------------------
-
-def json_error(status: int, code: str, message: str, extra: Dict[str, Any] | None = None):
-    payload = {"success": False, "error": code, "message": message}
-    if extra:
-        payload.update(extra)
-    return Response(json.dumps(payload, ensure_ascii=False), status=status, mimetype="application/json; charset=utf-8")
-
-@app.errorhandler(HTTPException)
-def handle_http_exception(e: HTTPException):
-    # Toutes les erreurs HTTP → JSON
-    return json_error(e.code or 500, "http_error", e.description or str(e))
-
-@app.errorhandler(413)
-def handle_413(e):
-    return json_error(413, "too_large", "Fichier trop volumineux (max 10 Mo).")
-
-@app.errorhandler(Exception)
-def handle_exception(e: Exception):
-    # Toute autre exception non gérée → 500 JSON (sans stacktrace HTML)
-    return json_error(500, "server_error", "Erreur interne lors du traitement.", {"detail": str(e)})
 
 # ---------------------------------------------------------------------------
 
@@ -70,20 +37,6 @@ def _save_upload(file_storage):
     path = os.path.join(tmpdir, file_storage.filename)
     file_storage.save(path)
     return path, tmpdir
-
-def _safe_extract(path: str) -> Dict[str, Any]:
-    """
-    Appelle l’extracteur avec gestion d’exception pour toujours retourner du JSON.
-    """
-    try:
-        data = extract_pdf(path)  # dict attendu
-        if not isinstance(data, dict):
-            raise ValueError("extract_pdf() doit renvoyer un dict")
-        return data
-    except Exception as e:
-        # On laisse aussi l’erreur remonter au handler global,
-        # mais ici on renvoie un dict "propre" si on souhaite l’utiliser.
-        raise
 
 def _build_summary_from_data(data: dict) -> dict:
     """
@@ -115,60 +68,57 @@ def _build_summary_from_data(data: dict) -> dict:
             raw_text = " ".join(str(v) for v in fields.values() if v)
         except Exception:
             raw_text = ""
-
     if raw_text:
         try:
             auto = summarize_from_text(raw_text)
-            if isinstance(auto, dict):
-                for k, v in auto.items():
-                    if summary.get(k) in (None, "", 0) and v not in (None, "", 0):
-                        summary[k] = v
+            for k, v in (auto or {}).items():
+                if summary.get(k) in (None, "", 0) and v not in (None, "", 0):
+                    summary[k] = v
         except Exception:
-            # On ignore si l’heuristique plante
             pass
 
     return summary
 
-# === JSON brut de l’extracteur ===
+# === JSON complet (meta + fields + lines + text_preview) ===
 @app.post("/api/convert")
 def api_convert_json():
     if "file" not in request.files:
-        return json_error(400, "file_missing", "Champ 'file' manquant.")
+        return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
     if not f.filename.lower().endswith(".pdf"):
-        return json_error(415, "not_pdf", "PDF uniquement.")
+        return jsonify({"success": False, "error": "not_pdf"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = _safe_extract(path)
-        # Important: toujours JSON explicite (et charset) pour éviter tout "JSON brut" non parsé
-        return Response(json.dumps(data, ensure_ascii=False), mimetype="application/json; charset=utf-8")
+        data = extract_pdf(path)  # -> dict
+        return jsonify(data)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# === CSV simple (quelques champs) ===
+# === CSV (résumé court) ===
 @app.post("/api/convert.csv")
 def api_convert_csv():
     if "file" not in request.files:
-        return json_error(400, "file_missing", "Champ 'file' manquant.")
+        return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
     if not f.filename.lower().endswith(".pdf"):
-        return json_error(415, "not_pdf", "PDF uniquement.")
+        return jsonify({"success": False, "error": "not_pdf"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = _safe_extract(path)
+        data = extract_pdf(path) or {}
         fields = (data or {}).get("fields", {}) if isinstance(data, dict) else {}
 
-        out = io.StringIO()
-        w = csv.writer(out, delimiter=';', lineterminator='\r\n')
+        out = io.StringIO(newline="")
+        w = csv.writer(out, delimiter=';', lineterminator='\r\n', quoting=csv.QUOTE_MINIMAL)
+        # colonnes fixes du résumé
         w.writerow(["invoice_number", "seller", "buyer", "total", "currency"])
         w.writerow([
-            fields.get("invoice_number", ""),
-            fields.get("seller", "N/A"),
-            fields.get("buyer", "N/A"),
-            fields.get("total_ttc", ""),
-            fields.get("currency", "EUR"),
+            fields.get("invoice_number", "") or "",
+            fields.get("seller", "") or "",
+            fields.get("buyer", "") or "",
+            fields.get("total_ttc", "") if fields.get("total_ttc") is not None else "",
+            fields.get("currency", "EUR") or "EUR",
         ])
 
         csv_text = '\ufeff' + out.getvalue()  # BOM UTF-8
@@ -184,43 +134,43 @@ def api_convert_csv():
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# === Résumé JSON ===
+# === Résumé JSON (flat) ===
 @app.post("/api/summary")
 def api_summary():
     if "file" not in request.files:
-        return json_error(400, "file_missing", "Champ 'file' manquant.")
+        return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
     if not f.filename.lower().endswith(".pdf"):
-        return json_error(415, "not_pdf", "PDF uniquement.")
+        return jsonify({"success": False, "error": "not_pdf"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = _safe_extract(path)
+        data = extract_pdf(path) or {}
         summary = _build_summary_from_data(data)
-        return Response(json.dumps(summary, ensure_ascii=False), mimetype="application/json; charset=utf-8")
+        return jsonify(summary)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# === Résumé CSV ===
+# === Résumé CSV (flat) ===
 @app.post("/api/summary.csv")
 def api_summary_csv():
     if "file" not in request.files:
-        return json_error(400, "file_missing", "Champ 'file' manquant.")
+        return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
     if not f.filename.lower().endswith(".pdf"):
-        return json_error(415, "not_pdf", "PDF uniquement.")
+        return jsonify({"success": False, "error": "not_pdf"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = _safe_extract(path)
+        data = extract_pdf(path) or {}
         summary = _build_summary_from_data(data)
 
-        out = io.StringIO()
-        w = csv.writer(out, delimiter=';', lineterminator='\r\n')
+        out = io.StringIO(newline="")
+        w = csv.writer(out, delimiter=';', lineterminator='\r\n', quoting=csv.QUOTE_MINIMAL)
         w.writerow(summary.keys())
-        w.writerow([summary.get(k, "") for k in summary.keys()])
+        w.writerow([summary.get(k, "") if summary.get(k) is not None else "" for k in summary.keys()])
 
-        csv_text = '\ufeff' + out.getvalue()  # BOM UTF-8
+        csv_text = '\ufeff' + out.getvalue()
         csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
         csv_bytes.seek(0)
 
@@ -229,6 +179,62 @@ def api_summary_csv():
             mimetype="text/csv; charset=utf-8",
             as_attachment=True,
             download_name="billxpert_summary.csv"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# === LIGNES JSON uniquement ===
+@app.post("/api/lines")
+def api_lines_json():
+    if "file" not in request.files:
+        return jsonify({"success": False, "error": "file_missing"}), 400
+    f = request.files["file"]
+    if not f.filename.lower().endswith(".pdf"):
+        return jsonify({"success": False, "error": "not_pdf"}), 400
+
+    path, tmpdir = _save_upload(f)
+    try:
+        data = extract_pdf(path) or {}
+        lines = (data or {}).get("lines", [])
+        return jsonify({"lines": lines, "count": len(lines)})
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# === LIGNES CSV ===
+@app.post("/api/lines.csv")
+def api_lines_csv():
+    if "file" not in request.files:
+        return jsonify({"success": False, "error": "file_missing"}), 400
+    f = request.files["file"]
+    if not f.filename.lower().endswith(".pdf"):
+        return jsonify({"success": False, "error": "not_pdf"}), 400
+
+    path, tmpdir = _save_upload(f)
+    try:
+        data = extract_pdf(path) or {}
+        lines = (data or {}).get("lines", []) or []
+
+        out = io.StringIO(newline="")
+        w = csv.writer(out, delimiter=';', lineterminator='\r\n', quoting=csv.QUOTE_MINIMAL)
+        w.writerow(["ref", "label", "qty", "unit_price", "amount"])
+        for r in lines:
+            w.writerow([
+                (r.get("ref") or ""),
+                (r.get("label") or ""),
+                (r.get("qty") if r.get("qty") is not None else ""),
+                (r.get("unit_price") if r.get("unit_price") is not None else ""),
+                (r.get("amount") if r.get("amount") is not None else "")
+            ])
+
+        csv_text = '\ufeff' + out.getvalue()
+        csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+        csv_bytes.seek(0)
+
+        return send_file(
+            csv_bytes,
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name="billxpert_lines.csv"
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
