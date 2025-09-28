@@ -2,17 +2,16 @@
 from pathlib import Path
 import re
 from typing import Optional, Dict, Any, List, Tuple
-
 from dateutil import parser as dateparser
 from pdfminer.high_level import extract_text
 
-# pdfplumber est optionnel : on l'utilise si dispo
+# pdfplumber optionnel
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None
 
-# ------------ REGEX de base ------------
+# =============== REGEX de base ===============
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
 TOTAL_RE = re.compile(
@@ -29,21 +28,22 @@ IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{1
 SELLER_BLOCK = re.compile(r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)', re.I | re.S)
 CLIENT_BLOCK = re.compile(r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)', re.I | re.S)
 
-# Fallback “une seule ligne”
+# Fallback “tout sur une ligne”
 LINE_ONE_RX = re.compile(
     r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
     r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
     re.M
 )
 
+# Taux TVA
 VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
 
-AMOUNT_RX = re.compile(r'([0-9]{1,3}(?:[ .][0-9]{3})*(?:[,.][0-9]{2}))')  # 1 000,00 / 120,00 / 90,00
-INT_RX    = re.compile(r'^\d{1,4}$')  # 1 / 12 / 2
-
+# Fallback “colonnes séparées”
+AMOUNT_RX = re.compile(r'([0-9]{1,3}(?:[ .][0-9]{3})*(?:[,.][0-9]{2}))')  # 1 000,00
+INT_RX    = re.compile(r'^\d{1,4}$')  # 1, 12, 2
 REF_LABEL_RX = re.compile(r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+)$')
 
-# ------------ Helpers ------------
+# =============== Helpers ===============
 def _norm_amount(s: str) -> Optional[float]:
     if not s:
         return None
@@ -58,8 +58,7 @@ def _norm_amount(s: str) -> Optional[float]:
         return None
 
 def _clean_block(s: str) -> Optional[str]:
-    import re as _re
-    s = _re.sub(r'\s+', ' ', s or '').strip()
+    s = re.sub(r'\s+', ' ', s or '').strip()
     return s or None
 
 def _approx(a: Optional[float], b: Optional[float], tol: float = 1.0) -> bool:
@@ -72,6 +71,7 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
     ht, tva, ttc = total_ht, total_tva, total_ttc
+
     if ttc is not None and (ht is None or tva is None):
         try:
             ht_calc = round(ttc / (1.0 + rate), 2)
@@ -80,6 +80,7 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
             if tva is None: tva = tva_calc
         except Exception:
             pass
+
     if ht is not None and (ttc is None or tva is None):
         try:
             tva_calc = round(ht * rate, 2)
@@ -88,16 +89,17 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
             if ttc is None: ttc = ttc_calc
         except Exception:
             pass
+
     if ttc is not None and tva is not None and ht is None:
         try:
             ht = round(ttc - tva, 2)
         except Exception:
             pass
+
     return ht, tva, ttc
 
-# ------------ Extraction des lignes ------------
+# =============== Extraction des lignes ===============
 def _parse_lines_onepass(text: str) -> List[Dict[str, Any]]:
-    """Cas simple: tout sur une ligne."""
     rows: List[Dict[str, Any]] = []
     for m in LINE_ONE_RX.finditer(text):
         rows.append({
@@ -110,26 +112,19 @@ def _parse_lines_onepass(text: str) -> List[Dict[str, Any]]:
     return rows
 
 def _parse_lines_by_columns(text: str) -> List[Dict[str, Any]]:
-    """
-    Heuristique pour les PDFs où:
-      - la liste des 'Réf — Libellé' est groupée,
-      - puis PLUS BAS une colonne 'Qté' avec 1 / 12 / 2,
-      - puis PLUS BAS 'PU' avec 1000,00 / 10,00 / 45,00,
-      - puis PLUS BAS 'Montant' avec 1000,00 / 120,00 / 90,00.
-    On aligne les 4 listes par index.
-    """
+    """ aligne ref/label + Qté + PU + Montant quand les colonnes sont séparées dans le texte """
     lines = [l.strip() for l in text.splitlines()]
-    # 1) capter les (ref, label) en séquence
+
+    # 1) séquence ref/label
     pairs: List[Tuple[str, str]] = []
     for ln in lines:
         m = REF_LABEL_RX.match(ln)
         if m:
             pairs.append((m.group('ref'), m.group('label').strip()))
-
     if not pairs:
         return []
 
-    # 2) repérer blocs "Qté" -> "PU" -> "Montant" -> "Total"
+    # 2) repères des sections
     def find_index(substrs: List[str]) -> int:
         for i, ln in enumerate(lines):
             lower = ln.lower()
@@ -156,7 +151,7 @@ def _parse_lines_by_columns(text: str) -> List[Dict[str, Any]]:
         for ln in lines[i_pu+1:i_amt]:
             m = AMOUNT_RX.search(ln)
             if m: pus.append(_norm_amount(m.group(1)))
-    # Montants jusqu’à Total HT (si présent), sinon jusqu’à la fin
+
     stop_idx = find_index(['total ht'])
     if stop_idx == -1:
         stop_idx = len(lines)
@@ -179,14 +174,12 @@ def _parse_lines_by_columns(text: str) -> List[Dict[str, Any]]:
     return rows
 
 def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
-    """Tentative extraction de tableau avec pdfplumber (si dispo)."""
     if pdfplumber is None:
         return []
     rows: List[Dict[str, Any]] = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                # Essais différents
                 tables = []
                 t = page.extract_table()
                 if t: tables.append(t)
@@ -197,14 +190,13 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                     tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
                     if len(tbl) < 2:
                         continue
-                    header = [h.lower() for h in tbl[0]]
-                    # repères simples
+                    head = [h.lower() for h in tbl[0]]
                     try:
-                        i_ref   = next((i for i,h in enumerate(header) if 'réf' in h or 'ref' in h or 'code' in h), None)
-                        i_label = next((i for i,h in enumerate(header) if 'désignation' in h or 'designation' in h or 'libellé' in h or 'label' in h), None)
-                        i_qty   = next((i for i,h in enumerate(header) if 'qté' in h or 'qte' in h or 'qty' in h), None)
-                        i_pu    = next((i for i,h in enumerate(header) if 'pu' in h or 'unit' in h), None)
-                        i_amt   = next((i for i,h in enumerate(header) if 'montant' in h or 'total' in h or 'amount' in h), None)
+                        i_ref   = next((i for i,h in enumerate(head) if 'réf' in h or 'ref' in h or 'code' in h), None)
+                        i_label = next((i for i,h in enumerate(head) if 'désignation' in h or 'designation' in h or 'libellé' in h or 'label' in h), None)
+                        i_qty   = next((i for i,h in enumerate(head) if 'qté' in h or 'qte' in h or 'qty' in h), None)
+                        i_pu    = next((i for i,h in enumerate(head) if 'pu' in h or 'unit' in h), None)
+                        i_amt   = next((i for i,h in enumerate(head) if 'montant' in h or 'total' in h or 'amount' in h), None)
                     except Exception:
                         i_ref = i_label = i_qty = i_pu = i_amt = None
 
@@ -212,8 +204,7 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                         continue
 
                     for row in tbl[1:]:
-                        def get(ix):
-                            return row[ix] if ix is not None and ix < len(row) else ''
+                        def get(ix): return row[ix] if ix is not None and ix < len(row) else ''
                         ref   = get(i_ref) or None
                         label = (get(i_label) or '').strip()
                         qty_s = get(i_qty)
@@ -226,13 +217,13 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                             except: qty = None
 
                         rows.append({
-                            "ref": ref,
-                            "label": label or ref,
-                            "qty": qty,
+                            "ref":        ref,
+                            "label":      label or ref,
+                            "qty":        qty,
                             "unit_price": _norm_amount(pu_s),
-                            "amount": _norm_amount(amt_s),
+                            "amount":     _norm_amount(amt_s),
                         })
-        # clean doublons
+        # dédoublonnage
         uniq, seen = [], set()
         for r in rows:
             key = (r.get('ref'), r.get('label'), r.get('qty'), r.get('unit_price'), r.get('amount'))
@@ -244,14 +235,16 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# ------------ Extraction principale ------------
+# =============== Extraction principale ===============
 def extract_pdf(path: str) -> Dict[str, Any]:
     p = Path(path)
     text = extract_text(p) or ""
 
-    meta = {"bytes": p.stat().st_size if p.exists() else None,
-            "pages": (text.count("\f") + 1) if text else 0,
-            "filename": p.name}
+    meta = {
+        "bytes": p.stat().st_size if p.exists() else None,
+        "pages": (text.count("\f") + 1) if text else 0,
+        "filename": p.name,
+    }
 
     # Numéro / date
     m_num = NUM_RE.search(text)
@@ -265,7 +258,7 @@ def extract_pdf(path: str) -> Dict[str, Any]:
         except Exception:
             invoice_date = None
 
-    # Totaux
+    # Total TTC
     m_total = TOTAL_RE.search(text)
     total_ttc = _norm_amount(m_total.group(1)) if m_total else None
     if total_ttc is None:
@@ -281,7 +274,7 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
     elif re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
 
-    # Taux TVA
+    # TVA rate
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
     if m_vat:
@@ -312,7 +305,7 @@ def extract_pdf(path: str) -> Dict[str, Any]:
     if m and not f.get("buyer"):
         f["buyer"] = _clean_block(m.group('blk'))
 
-    # Identifiants FR
+    # Identifiants FR vendeur
     m = TVA_RE.search(text)
     if m and not f.get("seller_tva"):
         f["seller_tva"] = m.group(0).replace(' ', '')
@@ -328,18 +321,12 @@ def extract_pdf(path: str) -> Dict[str, Any]:
 
     # Lignes
     lines: List[Dict[str, Any]] = []
-
-    # 1) pdfplumber si dispo
     try:
         lines = _parse_lines_with_pdfplumber(str(p))
     except Exception:
         lines = []
-
-    # 2) Fallback “tout sur une ligne”
     if not lines:
         lines = _parse_lines_onepass(text)
-
-    # 3) Fallback “colonnes séparées” (cas de ta facture)
     if not lines:
         lines = _parse_lines_by_columns(text)
 
