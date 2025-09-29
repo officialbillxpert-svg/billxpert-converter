@@ -5,3 +5,8 @@ pdfminer.six==20231228
 pikepdf==9.4.2
 python-dateutil==2.9.0.post0
 pdfplumber>=0.11.3
+
+pytesseract==0.3.10
+pdf2image==1.17.0
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
