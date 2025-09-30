@@ -2,10 +2,16 @@
 from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
 import tempfile, os, io, csv, shutil
+import shutil
+import pytesseract
 
 # Imports projet
 from .extractors.pdf_basic import extract_document  # << auto PDF/Image
 from .extractors.summary import summarize_from_text  # inchangé
+
+def tesseract_available():
+    return shutil.which("tesseract") is not None
+
 
 app = Flask(__name__)
 CORS(app)
