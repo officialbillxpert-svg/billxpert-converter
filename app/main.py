@@ -2,28 +2,10 @@
 from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
 import tempfile, os, io, csv, shutil
-import shutil
-import pytesseract
 
 # Imports projet
-from .extractors.pdf_basic import extract_document  # << auto PDF/Image
-from .extractors.summary import summarize_from_text  # inchangé
-
-def tesseract_available():
-    return shutil.which("tesseract") is not None
-
-def ocr_image(pil_image, lang="fra+eng"):
-    if not tesseract_available():
-        return {
-            "success": False,
-            "error": "tesseract_not_found",
-            "details": "Le serveur n’a pas Tesseract installé."
-        }
-    try:
-        txt = pytesseract.image_to_string(pil_image, lang=lang)
-        return {"success": True, "text": txt}
-    except Exception as e:
-        return {"success": False, "error": "tesseract_runtime_error", "details": str(e)}
+from .extractors.pdf_basic import extract_pdf
+from .extractors.summary import summarize_from_text  # ton heuristique texte
 
 app = Flask(__name__)
 CORS(app)
@@ -32,37 +14,47 @@ HTML_FORM = """
 <!doctype html><meta charset="utf-8">
 <title>BillXpert Converter — Test</title>
 <h1>BillXpert Converter — Test</h1>
-<p>Testez JSON / Résumé / Lignes à partir d’un PDF ou d’une image (PNG/JPG/TIFF/WebP).</p>
+<form method="post" action="/api/convert" enctype="multipart/form-data">
+  <input type="file" name="file" accept="application/pdf,image/png,image/jpeg" required>
+  <button type="submit">Voir JSON complet</button>
+</form>
+<p style="margin-top:12px">Autres :</p>
 <form method="post" action="/api/summary" enctype="multipart/form-data">
-  <input type="file" name="file" accept="application/pdf,image/png,image/jpeg,image/tiff,image/webp" required>
+  <input type="file" name="file" accept="application/pdf,image/png,image/jpeg" required>
   <button type="submit">Résumé JSON</button>
 </form>
+<form method="post" action="/api/summary.csv" enctype="multipart/form-data">
+  <input type="file" name="file" accept="application/pdf,image/png,image/jpeg" required>
+  <button type="submit">Résumé CSV</button>
+</form>
+<form method="post" action="/api/lines" enctype="multipart/form-data">
+  <input type="file" name="file" accept="application/pdf,image/png,image/jpeg" required>
+  <button type="submit">Lignes JSON</button>
+</form>
+<form method="post" action="/api/lines.csv" enctype="multipart/form-data">
+  <input type="file" name="file" accept="application/pdf,image/png,image/jpeg" required>
+  <button type="submit">Lignes CSV</button>
+</form>
 """
-
-ALLOWED_EXT = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 
 @app.get("/")
 def home():
     return render_template_string(HTML_FORM)
 
+# ---------------------------------------------------------------------------
+
+ACCEPT_EXT = {".pdf", ".png", ".jpg", ".jpeg"}
+
 def _save_upload(file_storage):
     tmpdir = tempfile.mkdtemp(prefix="bx_")
-    fname = file_storage.filename
-    path = os.path.join(tmpdir, fname)
+    path = os.path.join(tmpdir, file_storage.filename)
     file_storage.save(path)
     return path, tmpdir
 
-def _allowed(filename: str) -> bool:
-    ext = os.path.splitext(filename)[1].lower()
-    return ext in ALLOWED_EXT
-
 def _build_summary_from_data(data: dict) -> dict:
     data = data or {}
-    if data.get("success") is False:
-        # remonter l'erreur telle quelle
-        return data
-
     fields = data.get("fields", {}) if isinstance(data, dict) else {}
+
     summary = {
         "invoice_number": fields.get("invoice_number"),
         "invoice_date":   fields.get("invoice_date"),
@@ -78,13 +70,13 @@ def _build_summary_from_data(data: dict) -> dict:
         "lines_count":    fields.get("lines_count"),
     }
 
+    # Heuristique de complétion par texte brut
     raw_text = data.get("text") if isinstance(data, dict) else None
     if not raw_text:
         try:
             raw_text = " ".join(str(v) for v in fields.values() if v)
         except Exception:
             raw_text = ""
-
     if raw_text:
         auto = summarize_from_text(raw_text)
         for k, v in (auto or {}).items():
@@ -93,18 +85,26 @@ def _build_summary_from_data(data: dict) -> dict:
 
     return summary
 
-# === JSON BRUT ===
+def _ext_guard(filename: str) -> bool:
+    return os.path.splitext(filename)[1].lower() in ACCEPT_EXT
+
+def _ocr_flag() -> bool:
+    # permet /api/...?...&ocr=1 pour forcer l’OCR (sinon auto)
+    val = (request.args.get("ocr") or "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+# === JSON brut (tout) ===
 @app.post("/api/convert")
 def api_convert_json():
     if "file" not in request.files:
         return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
-    if not _allowed(f.filename):
-        return jsonify({"success": False, "error": "unsupported", "allowed": list(ALLOWED_EXT)}), 400
+    if not _ext_guard(f.filename):
+        return jsonify({"success": False, "error": "unsupported_file"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = extract_document(path)
+        data = extract_pdf(path, ocr=_ocr_flag())  # OCR auto si scan / image; forcé si ocr=1
         return jsonify(data)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -115,12 +115,12 @@ def api_summary():
     if "file" not in request.files:
         return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
-    if not _allowed(f.filename):
-        return jsonify({"success": False, "error": "unsupported", "allowed": list(ALLOWED_EXT)}), 400
+    if not _ext_guard(f.filename):
+        return jsonify({"success": False, "error": "unsupported_file"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = extract_document(path) or {}
+        data = extract_pdf(path, ocr=_ocr_flag()) or {}
         summary = _build_summary_from_data(data)
         return jsonify(summary)
     finally:
@@ -132,25 +132,23 @@ def api_summary_csv():
     if "file" not in request.files:
         return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
-    if not _allowed(f.filename):
-        return jsonify({"success": False, "error": "unsupported", "allowed": list(ALLOWED_EXT)}), 400
+    if not _ext_guard(f.filename):
+        return jsonify({"success": False, "error": "unsupported_file"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = extract_document(path) or {}
+        data = extract_pdf(path, ocr=_ocr_flag()) or {}
         summary = _build_summary_from_data(data)
-        if summary.get("success") is False:
-            return jsonify(summary), 500
 
         out = io.StringIO()
         w = csv.writer(out, delimiter=';', lineterminator='\r\n')
-        headers = ["invoice_number","invoice_date","seller","seller_siret","seller_tva","seller_iban",
-                   "buyer","total_ht","total_tva","total_ttc","currency","lines_count"]
-        w.writerow(headers)
-        w.writerow([summary.get(h, "") for h in headers])
+        w.writerow(summary.keys())
+        w.writerow([summary.get(k, "") for k in summary.keys()])
 
-        csv_text = '\ufeff' + out.getvalue()
-        csv_bytes = io.BytesIO(csv_text.encode("utf-8")); csv_bytes.seek(0)
+        csv_text = '\ufeff' + out.getvalue()  # BOM UTF-8
+        csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+        csv_bytes.seek(0)
+
         return send_file(
             csv_bytes,
             mimetype="text/csv; charset=utf-8",
@@ -162,20 +160,21 @@ def api_summary_csv():
 
 # === LIGNES : JSON ===
 @app.post("/api/lines")
-def api_lines_json():
+def api_lines():
     if "file" not in request.files:
         return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
-    if not _allowed(f.filename):
-        return jsonify({"success": False, "error": "unsupported", "allowed": list(ALLOWED_EXT)}), 400
+    if not _ext_guard(f.filename):
+        return jsonify({"success": False, "error": "unsupported_file"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = extract_document(path) or {}
-        if data.get("success") is False:
-            return jsonify(data), 500
-        lines = data.get("lines") or []
-        return jsonify({"success": True, "count": len(lines), "lines": lines})
+        data = extract_pdf(path, ocr=_ocr_flag()) or {}
+        lines = (data or {}).get("lines") or []
+        return jsonify({
+            "count": len(lines),
+            "lines": lines
+        })
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -185,30 +184,29 @@ def api_lines_csv():
     if "file" not in request.files:
         return jsonify({"success": False, "error": "file_missing"}), 400
     f = request.files["file"]
-    if not _allowed(f.filename):
-        return jsonify({"success": False, "error": "unsupported", "allowed": list(ALLOWED_EXT)}), 400
+    if not _ext_guard(f.filename):
+        return jsonify({"success": False, "error": "unsupported_file"}), 400
 
     path, tmpdir = _save_upload(f)
     try:
-        data = extract_document(path) or {}
-        if data.get("success") is False:
-            return jsonify(data), 500
-        lines = data.get("lines") or []
+        data = extract_pdf(path, ocr=_ocr_flag()) or {}
+        lines = (data or {}).get("lines") or []
 
         out = io.StringIO()
         w = csv.writer(out, delimiter=';', lineterminator='\r\n')
-        w.writerow(["ref","label","qty","unit_price","amount"])
+        w.writerow(["ref", "label", "qty", "unit_price", "amount"])
         for r in lines:
             w.writerow([
-                r.get("ref",""),
-                r.get("label",""),
-                r.get("qty",""),
-                r.get("unit_price",""),
-                r.get("amount",""),
+                (r.get("ref") or ""),
+                (r.get("label") or ""),
+                (r.get("qty") or ""),
+                (r.get("unit_price") or ""),
+                (r.get("amount") or ""),
             ])
 
         csv_text = '\ufeff' + out.getvalue()
-        csv_bytes = io.BytesIO(csv_text.encode("utf-8")); csv_bytes.seek(0)
+        csv_bytes = io.BytesIO(csv_text.encode("utf-8"))
+        csv_bytes.seek(0)
         return send_file(
             csv_bytes,
             mimetype="text/csv; charset=utf-8",
@@ -218,7 +216,7 @@ def api_lines_csv():
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# SANTÉ
+# --- Santé ---
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True})
