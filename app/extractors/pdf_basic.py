@@ -1,11 +1,19 @@
 # app/extractors/pdf_basic.py
-from pdfminer.high_level import extract_text
+from pdfminer.high_level import extract_text as _extract_text
 from dateutil import parser as dateparser
 from pathlib import Path
-import re
+import re, io
 from typing import Optional, Dict, Any, List, Tuple
 
-# import "safe" de pdfplumber (optionnel)
+# --- OCR (optionnel) ---
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:
+    pytesseract = None
+    Image = None
+
+# --- pdfplumber (optionnel) ---
 try:
     import pdfplumber
 except Exception:
@@ -36,7 +44,7 @@ CLIENT_BLOCK = re.compile(
     re.I | re.S
 )
 
-# Lignes article (fallback texte “ligne unique”)
+# Lignes article (fallback texte)
 LINE_RX = re.compile(
     r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
     r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
@@ -46,7 +54,7 @@ LINE_RX = re.compile(
 # Taux TVA
 VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
 
-# Entêtes potentielles pour pdfplumber
+# Hints d’entêtes (pdfplumber)
 TABLE_HEADER_HINTS = [
     ("ref", "réf", "reference", "code"),
     ("désignation", "designation", "libellé", "description", "label"),
@@ -64,8 +72,6 @@ def _norm_amount(s: str) -> Optional[float]:
         s = s.replace('.', '').replace(',', '.')
     elif ',' in s:
         s = s.replace(',', '.')
-    # retirer symbole €
-    s = s.replace('€','')
     try:
         return round(float(s), 2)
     except Exception:
@@ -76,10 +82,11 @@ def _clean_block(s: str) -> Optional[str]:
     return s or None
 
 def _parse_lines(text: str) -> List[Dict[str, Any]]:
-    """Fallback naïf: chaque article sur une seule ligne (rarement le cas dans ton PDF)."""
     rows: List[Dict[str, Any]] = []
     for m in LINE_RX.finditer(text):
-        qty = int(m.group('qty'))
+        qty = None
+        try: qty = int(m.group('qty'))
+        except: pass
         pu  = _norm_amount(m.group('pu'))
         amt = _norm_amount(m.group('amt'))
         rows.append({
@@ -221,86 +228,12 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# ---------- Fallback “par colonnes” sur texte brut ----------
-def _parse_lines_from_columns(text: str) -> List[Dict[str, Any]]:
-    """
-    Pour les PDF où le texte sort en colonnes séparées :
-    - labels sur plusieurs lignes
-    - puis toutes les quantités
-    - puis une liste de prix (PU et Montant mélangés)
-    On isole la zone Réf/Désignation -> Totaux, puis on recompose.
-    """
-    # isoler la zone centrale
-    start = re.search(r'(?:^|\n)\s*(?:Réf\s*\/\s*Désignation|Designation|Description)\b', text, re.I)
-    end   = re.search(r'(?:^|\n)\s*(?:Total\s+HT|Total\s+TTC|Grand\s+total|Montant\s+TTC)\b', text, re.I)
-    if not start or not end or end.start() <= start.start():
-        return []
-
-    zone = text[start.end():end.start()]
-
-    # labels = lignes qui ressemblent aux références libellés
-    label_rx = re.compile(r'^\s*(?P<label>(?:[A-Z0-9][A-Z0-9\-_/]+)\s+[—\-]\s+.+?)\s*$', re.M)
-    labels = [m.group('label').strip() for m in label_rx.finditer(zone)]
-
-    # quantités = petites entières isolées sur leur ligne (1..999)
-    qty_rx = re.compile(r'^\s*([1-9]\d{0,2})\s*$', re.M)
-    qtys = [int(m.group(1)) for m in qty_rx.finditer(zone)]
-
-    # prix = montants monétaires (avec € possible)
-    price_rx = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)\s*€?')
-    prices = [_norm_amount(m.group(1)) for m in price_rx.finditer(zone)]
-    prices = [p for p in prices if p is not None]
-
-    n = min(len(labels), len(qtys))
-    if n == 0:
-        return []
-
-    # Heuristique : pour chaque i, on prend deux prix consécutifs (PU, Montant)
-    # et on vérifie que montant ≈ PU * qty[i] (tolérance 1.5)
-    rows: List[Dict[str, Any]] = []
-    pi = 0  # index dans la liste prices
-    for i in range(n):
-        label = labels[i]
-        qty   = qtys[i]
-        pu, amt = None, None
-
-        # il nous faut 2 prix au moins pour former un couple
-        if pi + 1 < len(prices):
-            cand_pu  = prices[pi]
-            cand_amt = prices[pi + 1]
-            if cand_pu is not None and cand_amt is not None:
-                # test de cohérence
-                if _approx(cand_pu * qty, cand_amt, tol=1.5):
-                    pu, amt = cand_pu, cand_amt
-                    pi += 2
-                else:
-                    # tenter permutation (parfois l'ordre est inversé selon extraction exotique)
-                    if _approx(cand_amt * qty, cand_pu, tol=1.5):
-                        pu, amt = cand_amt, cand_pu
-                        pi += 2
-                    else:
-                        # pas cohérent, on ne consomme qu'1 prix (on espère mieux au prochain)
-                        pi += 1
-        # fallback: si pas trouvé, pu/amt restent None
-        rows.append({
-            "ref":   label.split('—', 1)[0].strip() if '—' in label else None,
-            "label": label,
-            "qty":   qty,
-            "unit_price": pu,
-            "amount":     amt
-        })
-
-    return rows
-
-# ---------- Extraction principale ----------
-def extract_pdf(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
-    p = Path(path)
-    text = extract_text(p) or ""
-
+# ---------- Parsing commun à partir de texte ----------
+def _parse_from_text(text: str, filename: str) -> Dict[str, Any]:
     meta = {
-        "bytes": p.stat().st_size if p.exists() else None,
-        "pages": (text.count("\f") + 1) if text else 0,
-        "filename": p.name,
+        "bytes": None,           # rempli par l’appelant si besoin
+        "pages": text.count("\f") + 1 if text else 0,
+        "filename": filename,
     }
 
     # Champs simples
@@ -330,14 +263,13 @@ def extract_pdf(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
     elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
     elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
 
-    # Taux TVA
+    # TVA
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
     if m_vat:
         vr = m_vat.group(1)
         vat_rate = '5.5' if vr in ('5,5', '5.5') else vr
 
-    # Résultat initial
     result: Dict[str, Any] = {
         "success": True,
         "meta": meta,
@@ -354,7 +286,7 @@ def extract_pdf(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # Vendeur / Client (blocs)
+    # Seller / Buyer
     m = SELLER_BLOCK.search(text)
     if m and not fields.get("seller"):
         fields["seller"] = _clean_block(m.group('blk'))
@@ -363,7 +295,7 @@ def extract_pdf(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
     if m and not fields.get("buyer"):
         fields["buyer"] = _clean_block(m.group('blk'))
 
-    # Identifiants FR (vendeur)
+    # IDs FR
     m = TVA_RE.search(text)
     if m and not fields.get("seller_tva"):
         fields["seller_tva"] = m.group(0).replace(' ', '')
@@ -380,23 +312,14 @@ def extract_pdf(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
 
-    # Lignes d'articles (3 niveaux de fallback)
-    lines: List[Dict[str, Any]] = []
-    try:
-        lines = _parse_lines_with_pdfplumber(str(p))
-    except Exception:
-        lines = []
-    if not lines:
-        lines = _parse_lines(text)  # “ligne unique”
-    if not lines:
-        lines = _parse_lines_from_columns(text)  # regroupement colonnes
-
+    # Lignes (fallback texte)
+    lines = _parse_lines(text)
     if lines:
         result["lines"] = lines
         fields["lines_count"] = len(lines)
-
         sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
 
+        total_ttc = fields.get("total_ttc")
         if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
             total_ht, total_tva, total_ttc2 = _infer_totals(total_ttc, None, None, vat_rate)
             fields["total_ht"]  = total_ht
@@ -410,3 +333,71 @@ def extract_pdf(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
             if tt is not None: fields["total_ttc"] = tt
 
     return result
+
+# ---------- Public: PDF ----------
+def extract_pdf(path: str) -> Dict[str, Any]:
+    p = Path(path)
+    text = _extract_text(p) or ""
+    data = _parse_from_text(text, p.name)
+    # remplir meta.bytes/pages si possible
+    try:
+        data["meta"]["bytes"] = p.stat().st_size
+        data["meta"]["pages"] = text.count("\f") + 1 if text else 0
+    except Exception:
+        pass
+
+    # Essai lignes via pdfplumber pour meilleure fiabilité
+    try:
+        lines = _parse_lines_with_pdfplumber(str(p))
+        if lines:
+            data["lines"] = lines
+            data["fields"]["lines_count"] = len(lines)
+    except Exception:
+        pass
+
+    return data
+
+# ---------- Public: Image (OCR) ----------
+def extract_image(path: str, lang: str = "fra+eng") -> Dict[str, Any]:
+    p = Path(path)
+    if pytesseract is None or Image is None:
+        return {
+            "success": False,
+            "error": "ocr_unavailable",
+            "details": "pytesseract/Pillow indisponible ou Tesseract non installé."
+        }
+    try:
+        img = Image.open(p)
+    except Exception as e:
+        return {"success": False, "error": "image_open_failed", "details": str(e)}
+
+    try:
+        text = pytesseract.image_to_string(img, lang=lang)
+    except pytesseract.TesseractNotFoundError:
+        return {
+            "success": False,
+            "error": "tesseract_not_found",
+            "details": "Le binaire Tesseract n'est pas présent sur le serveur."
+        }
+    except Exception as e:
+        return {"success": False, "error": "ocr_failed", "details": str(e)}
+
+    data = _parse_from_text(text or "", p.name)
+    # meta.bytes
+    try:
+        data["meta"]["bytes"] = p.stat().st_size
+        data["meta"]["pages"] = 1
+    except Exception:
+        pass
+    return data
+
+# ---------- Public: auto (PDF ou Image) ----------
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
+
+def extract_document(path: str) -> Dict[str, Any]:
+    ext = Path(path).suffix.lower()
+    if ext == ".pdf":
+        return extract_pdf(path)
+    if ext in IMAGE_EXTS:
+        return extract_image(path)
+    return {"success": False, "error": "unsupported_file_type", "details": ext}
