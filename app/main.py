@@ -12,6 +12,18 @@ from .extractors.summary import summarize_from_text  # inchangé
 def tesseract_available():
     return shutil.which("tesseract") is not None
 
+def ocr_image(pil_image, lang="fra+eng"):
+    if not tesseract_available():
+        return {
+            "success": False,
+            "error": "tesseract_not_found",
+            "details": "Le serveur n’a pas Tesseract installé."
+        }
+    try:
+        txt = pytesseract.image_to_string(pil_image, lang=lang)
+        return {"success": True, "text": txt}
+    except Exception as e:
+        return {"success": False, "error": "tesseract_runtime_error", "details": str(e)}
 
 app = Flask(__name__)
 CORS(app)
