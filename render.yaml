@@ -1,10 +1,8 @@
 services:
   - type: web
     name: billxpert-converter
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app.main:app --bind 0.0.0.0:$PORT"
+    env: docker
     plan: free
     branch: main
-    healthCheckPath: /healthz
     autoDeploy: true
+    healthCheckPath: /healthz
