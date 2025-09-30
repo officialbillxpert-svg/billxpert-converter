@@ -399,3 +399,12 @@ def extract_pdf(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict
             if tt is not None: fields["total_ttc"] = tt
 
     return result
+
+# -----------------------------------------------------
+# ALIAS pour compatibilité avec app.main: extract_document
+# -----------------------------------------------------
+def extract_document(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict[str, Any]:
+    """
+    Alias de extract_pdf pour compatibilité (certains main.py importent extract_document).
+    """
+    return extract_pdf(path, ocr=ocr, ocr_lang=ocr_lang)
