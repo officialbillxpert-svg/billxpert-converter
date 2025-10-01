@@ -4,7 +4,7 @@ from flask_cors import CORS
 import tempfile, os, io, csv, shutil
 
 # Imports projet
-from .extractors.pdf_basic import extract_pdf
+from .extractors.pdf_basic import extract_document as extract_pdf
 from .extractors.summary import summarize_from_text  # ton heuristique texte
 
 app = Flask(__name__)
