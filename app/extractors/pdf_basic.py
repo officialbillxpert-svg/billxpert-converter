@@ -1,29 +1,47 @@
 # app/extractors/pdf_basic.py
+from __future__ import annotations
+
+import io
+import os
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
-import re
-
-# --- PDF texte
-from pdfminer.high_level import extract_text as pdfminer_extract_text
-# --- OCR
-import pytesseract
-from PIL import Image
-from pdf2image import convert_from_path
 
 from dateutil import parser as dateparser
 
-# pdfplumber (tables) optionnel mais installé dans requirements
+# --- PDF texte
+try:
+    from pdfminer.high_level import extract_text as _extract_text
+except Exception:
+    _extract_text = None
+
+# --- Optionnel : pdfplumber pour tableaux
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None
 
-# =======================
-#        REGEX
-# =======================
+# --- OCR image
+try:
+    from PIL import Image, ImageFilter, ImageOps
+except Exception:
+    Image = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+
+# =========================
+# Regex & constantes
+# =========================
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
-TOTAL_RE = re.compile(r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)', re.I)
+TOTAL_RE = re.compile(
+    r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
+    re.I
+)
 EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)')
 
 SIRET_RE = re.compile(r'\b\d{14}\b')
@@ -31,10 +49,15 @@ SIREN_RE = re.compile(r'(?<!\d)\d{9}(?!\d)')
 TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
 IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
 
-SELLER_BLOCK = re.compile(r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)', re.I | re.S)
-CLIENT_BLOCK = re.compile(r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)', re.I | re.S)
+SELLER_BLOCK = re.compile(
+    r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)',
+    re.I | re.S
+)
+CLIENT_BLOCK = re.compile(
+    r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)',
+    re.I | re.S
+)
 
-# Fallback lignes (texte OCR ou brut)
 LINE_RX = re.compile(
     r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
     r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
@@ -51,11 +74,13 @@ TABLE_HEADER_HINTS = [
     ("montant", "total", "amount")
 ]
 
-# =======================
-#     HELPERS GÉNÉRAUX
-# =======================
+
+# =========================
+# Helpers communs
+# =========================
 def _norm_amount(s: str) -> Optional[float]:
-    if not s: return None
+    if not s:
+        return None
     s = s.strip().replace(' ', '')
     if ',' in s and '.' in s:
         s = s.replace('.', '').replace(',', '.')
@@ -70,6 +95,21 @@ def _clean_block(s: str) -> Optional[str]:
     s = re.sub(r'\s+', ' ', s or '').strip()
     return s or None
 
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for m in LINE_RX.finditer(text):
+        qty = int(m.group('qty'))
+        pu  = _norm_amount(m.group('pu'))
+        amt = _norm_amount(m.group('amt'))
+        rows.append({
+            "ref":        m.group('ref'),
+            "label":      m.group('label').strip(),
+            "qty":        qty,
+            "unit_price": pu,
+            "amount":     amt
+        })
+    return rows
+
 def _approx(a: Optional[float], b: Optional[float], tol: float = 1.0) -> bool:
     if a is None or b is None:
         return False
@@ -79,6 +119,7 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
+
     ht, tva, ttc = total_ht, total_tva, total_ttc
 
     if ttc is not None and (ht is None or tva is None):
@@ -107,13 +148,14 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
 
     return ht, tva, ttc
 
-# =======================
-#   pdfplumber (tables)
-# =======================
+
+# =========================
+# pdfplumber helpers (tables)
+# =========================
 def _norm_header_cell(s: str) -> str:
     s = (s or "").strip().lower()
     s = (s.replace("é","e").replace("è","e").replace("ê","e")
-         .replace("à","a").replace("û","u").replace("ï","i"))
+           .replace("à","a").replace("û","u").replace("ï","i"))
     s = s.replace("\n"," ").replace("\t"," ")
     s = re.sub(r"\s+"," ", s)
     return s
@@ -189,11 +231,10 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                             "unit_price": pu_f,
                             "amount":     amt_f
                         })
-        # dédoublonnage
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
-            if key in seen: 
+            if key in seen:
                 continue
             seen.add(key)
             uniq.append(r)
@@ -201,97 +242,108 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# =======================
-#       OCR / TEXTE
-# =======================
-def _ocr_image(img: Image.Image, lang: str = "fra+eng") -> str:
+
+# =========================
+# OCR image helpers
+# =========================
+def _have_ocr() -> bool:
+    return pytesseract is not None and Image is not None
+
+def _ocr_langs() -> str:
+    return os.getenv("OCR_LANGS", "fra+eng")
+
+def _preprocess_image(img: "Image.Image") -> "Image.Image":
+    # Grayscale
+    g = ImageOps.grayscale(img)
+    # Upscale 3x (améliore nettement Tesseract sur photos d’écran)
+    w, h = g.size
+    scale = 3  # 300%
+    g = g.resize((w*scale, h*scale), Image.Resampling.LANCZOS)
+    # Légère réduction de bruit / lissage
+    g = g.filter(ImageFilter.MedianFilter(size=3))
+    # Binarisation Otsu “approx” (PIL ne fait pas Otsu natif, on fait simple)
+    # On utilise autocontrast qui marche bien sur des factures propres
+    g = ImageOps.autocontrast(g, cutoff=2)
+    # Sharpen léger
+    g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=3))
+    return g
+
+def _ocr_image_to_text(img: "Image.Image") -> str:
+    if not _have_ocr():
+        return ""
+    lang = _ocr_langs()
+    # premier essai psm6
+    cfg = "--oem 3 --psm 6"
+    txt = pytesseract.image_to_string(img, lang=lang, config=cfg) or ""
+    txt = txt.strip()
+    if txt:
+        return txt
+    # deuxième essai : un peu plus zoomé + psm4
+    w, h = img.size
+    zoom = img.resize((int(w*1.33), int(h*1.33)), Image.Resampling.LANCZOS)
+    cfg2 = "--oem 3 --psm 4"
+    txt2 = pytesseract.image_to_string(zoom, lang=lang, config=cfg2) or ""
+    return (txt2 or "").strip()
+
+def _extract_text_from_image(path: Path) -> str:
+    if not _have_ocr():
+        return ""
     try:
-        return pytesseract.image_to_string(img, lang=lang)
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            pim = _preprocess_image(im)
+            return _ocr_image_to_text(pim)
     except Exception:
         return ""
 
-def _extract_text_any(path: Path, ocr: bool = False, ocr_lang: str = "fra+eng") -> Tuple[str, Dict[str, Any]]:
+
+# =========================
+# Extraction principale
+# =========================
+def extract_document(path: str | Path, mime: Optional[str] = None) -> Dict[str, Any]:
     """
-    Retourne (text, flags) :
-      - text : texte brut
-      - flags: { "ocr_used": bool, "pages_ocr": int, "from_images": bool }
+    Route unique : accepte PDF ou image (PNG/JPG).
+    - PDF -> pdfminer/pdfplumber + heuristique
+    - Image -> OCR (pytesseract) + mêmes regex
     """
-    flags = {"ocr_used": False, "pages_ocr": 0, "from_images": False}
-    suffix = path.suffix.lower()
-
-    # Images directes → OCR
-    if suffix in {".png", ".jpg", ".jpeg"}:
-        try:
-            img = Image.open(str(path))
-            text = _ocr_image(img, lang=ocr_lang)
-            flags.update({"ocr_used": True, "pages_ocr": 1, "from_images": True})
-            return text or "", flags
-        except Exception:
-            return "", flags
-
-    # PDF
-    if suffix == ".pdf":
-        # 1) Essai texte natif
-        try:
-            txt = pdfminer_extract_text(str(path)) or ""
-        except Exception:
-            txt = ""
-
-        # Heuristique : si très peu de texte → probablement scanné
-        low_text = len((txt or "").strip()) < 120
-
-        if ocr or low_text:
-            # 2) OCR des pages via pdf2image + Tesseract
-            try:
-                pages = convert_from_path(str(path), dpi=300)  # nécessite poppler-utils
-                ocr_txts = []
-                for im in pages:
-                    ocr_txts.append(_ocr_image(im, lang=ocr_lang))
-                text = "\n".join(ocr_txts)
-                flags.update({"ocr_used": True, "pages_ocr": len(pages), "from_images": True})
-                return text, flags
-            except Exception:
-                # fallback : renvoyer malgré tout le texte natif (même vide)
-                return txt or "", flags
-
-        # sinon on garde le texte natif
-        return txt or "", flags
-
-    # Autres extensions : rien
-    return "", flags
-
-def _parse_lines(text: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for m in LINE_RX.finditer(text):
-        qty = int(m.group('qty'))
-        pu  = _norm_amount(m.group('pu'))
-        amt = _norm_amount(m.group('amt'))
-        rows.append({
-            "ref":        m.group('ref'),
-            "label":      m.group('label').strip(),
-            "qty":        qty,
-            "unit_price": pu,
-            "amount":     amt
-        })
-    return rows
-
-# =======================
-#   EXTRACTION PRINCIPALE
-# =======================
-def extract_pdf(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict[str, Any]:
     p = Path(path)
+    ext = p.suffix.lower()
+    is_image = ext in {".png", ".jpg", ".jpeg"}
+    from_images = False
+    ocr_used = False
+    ocr_pages = 0
 
-    text, ocr_flags = _extract_text_any(p, ocr=ocr, ocr_lang=ocr_lang)  # <-- texte prêt (PDF natif ou OCR)
+    # --- obtenir le texte brut
+    text = ""
+    if is_image:
+        from_images = True
+        if _have_ocr():
+            ocr_used = True
+            text = _extract_text_from_image(p)
+            ocr_pages = 1
+        else:
+            text = ""
+    else:
+        # PDF
+        if _extract_text is not None:
+            text = _extract_text(p) or ""
+        else:
+            text = ""
+
+        # Si texte PDF vide et OCR disponible, on pourrait rasterizer et OCRiser page par page.
+        # (on garde simple ici: uniquement image → OCR ; amélioration possible plus tard)
+        # -> on ne modifie pas ocr_used ici.
+
     meta = {
         "bytes": p.stat().st_size if p.exists() else None,
-        "pages": text.count("\f") + 1 if text else 0,
+        "pages": (text.count("\f") + 1) if (text and not is_image) else (0 if not is_image else 0),
         "filename": p.name,
-        "ocr_used": ocr_flags.get("ocr_used", False),
-        "ocr_pages": ocr_flags.get("pages_ocr", 0),
-        "from_images": ocr_flags.get("from_images", False),
+        "from_images": from_images,
+        "ocr_used": ocr_used,
+        "ocr_pages": ocr_pages
     }
 
-    # --- Champs simples ---
+    # Champs simples
     m_num = NUM_RE.search(text)
     invoice_number = m_num.group(1).strip() if m_num else None
 
@@ -311,14 +363,12 @@ def extract_pdf(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict
         if amounts:
             total_ttc = max(amounts)
 
-    # Devise
     currency = None
     if re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
     elif re.search(r"\bGBP\b|£", text, re.I): currency = "GBP"
     elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
     elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
 
-    # Taux TVA
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
     if m_vat:
@@ -336,12 +386,12 @@ def extract_pdf(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict
             "total_ttc": total_ttc,
             "currency":  currency or "EUR",
         },
-        "text": text[:20000],
-        "text_preview": text[:2000],
+        "text": text[:20000] if text else "",
+        "text_preview": text[:2000] if text else "",
     }
     fields = result["fields"]
 
-    # Vendeur / Client
+    # Blocs parties
     m = SELLER_BLOCK.search(text)
     if m and not fields.get("seller"):
         fields["seller"] = _clean_block(m.group('blk'))
@@ -367,17 +417,17 @@ def extract_pdf(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
 
-    # Lignes d'articles
+    # Lignes d'articles : sur PDF on tente pdfplumber + fallback regex.
     lines: List[Dict[str, Any]] = []
-    # pdfplumber seulement pour PDF (images: inutile)
-    if p.suffix.lower() == ".pdf":
+    if not is_image:
         try:
             lines = _parse_lines_with_pdfplumber(str(p))
         except Exception:
             lines = []
-
-    if not lines:
-        # fallback regex sur texte (marche aussi avec OCR)
+        if not lines:
+            lines = _parse_lines(text)
+    else:
+        # Image OCR -> uniquement regex (on n’a pas de structure tableau)
         lines = _parse_lines(text)
 
     if lines:
@@ -399,12 +449,3 @@ def extract_pdf(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict
             if tt is not None: fields["total_ttc"] = tt
 
     return result
-
-# -----------------------------------------------------
-# ALIAS pour compatibilité avec app.main: extract_document
-# -----------------------------------------------------
-def extract_document(path: str, ocr: bool = False, ocr_lang: str = "fra+eng") -> Dict[str, Any]:
-    """
-    Alias de extract_pdf pour compatibilité (certains main.py importent extract_document).
-    """
-    return extract_pdf(path, ocr=ocr, ocr_lang=ocr_lang)
