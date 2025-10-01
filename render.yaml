@@ -1,15 +1,8 @@
 services:
   - type: web
     name: billxpert-converter
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app.main:app --bind 0.0.0.0:$PORT"
+    env: docker
     plan: free
-    healthCheckPath: /healthz
+    dockerfilePath: ./Dockerfile
     autoDeploy: true
-    buildFilters: []
-    # Apt packages pour Tesseract
-    apt:
-      packages:
-        - tesseract-ocr
-        - tesseract-ocr-fra
+    healthCheckPath: /healthz
