@@ -1,41 +1,39 @@
 # app/extractors/pdf_basic.py
 from __future__ import annotations
-
-import io
-import os
-import re
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
+import re
 
-from dateutil import parser as dateparser
-
-# --- PDF texte
+# ---- Imports "safe" (tout protégé pour éviter les crashs au démarrage) ----
 try:
     from pdfminer.high_level import extract_text as _extract_text
 except Exception:
     _extract_text = None
 
-# --- Optionnel : pdfplumber pour tableaux
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None
 
-# --- OCR image
 try:
-    from PIL import Image, ImageFilter, ImageOps
+    import pikepdf  # utile pour certains PDF problématiques (optionnel)
+except Exception:
+    pikepdf = None
+
+# OCR (facultatif) : entièrement protégé
+try:
+    from PIL import Image
 except Exception:
     Image = None
-
 try:
     import pytesseract
 except Exception:
     pytesseract = None
 
+from dateutil import parser as dateparser
 
-# =========================
-# Regex & constantes
-# =========================
+
+# ----------------------- REGEX & CONSTANTES -----------------------
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
 TOTAL_RE = re.compile(
@@ -75,9 +73,7 @@ TABLE_HEADER_HINTS = [
 ]
 
 
-# =========================
-# Helpers communs
-# =========================
+# ----------------------- HELPERS GÉNÉRIQUES -----------------------
 def _norm_amount(s: str) -> Optional[float]:
     if not s:
         return None
@@ -95,21 +91,6 @@ def _clean_block(s: str) -> Optional[str]:
     s = re.sub(r'\s+', ' ', s or '').strip()
     return s or None
 
-def _parse_lines(text: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for m in LINE_RX.finditer(text):
-        qty = int(m.group('qty'))
-        pu  = _norm_amount(m.group('pu'))
-        amt = _norm_amount(m.group('amt'))
-        rows.append({
-            "ref":        m.group('ref'),
-            "label":      m.group('label').strip(),
-            "qty":        qty,
-            "unit_price": pu,
-            "amount":     amt
-        })
-    return rows
-
 def _approx(a: Optional[float], b: Optional[float], tol: float = 1.0) -> bool:
     if a is None or b is None:
         return False
@@ -119,7 +100,6 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
-
     ht, tva, ttc = total_ht, total_tva, total_ttc
 
     if ttc is not None and (ht is None or tva is None):
@@ -149,9 +129,29 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
     return ht, tva, ttc
 
 
-# =========================
-# pdfplumber helpers (tables)
-# =========================
+# ----------------------- OCR -----------------------
+def _ocr_image_to_text(path: Path) -> Dict[str, Any]:
+    """
+    OCR d'une image (PNG/JPG). Retourne { success, text, error? }.
+    Si pytesseract/PIL/tesseract binaire manquent -> success=False + error.
+    """
+    if Image is None or pytesseract is None:
+        return {"success": False, "error": "tesseract_not_found", "details": "PIL/pytesseract non installés."}
+    try:
+        img = Image.open(path)
+    except Exception as e:
+        return {"success": False, "error": "image_open_failed", "details": str(e)}
+
+    try:
+        txt = pytesseract.image_to_string(img, lang="fra+eng")
+        return {"success": True, "text": txt or ""}
+    except pytesseract.pytesseract.TesseractNotFoundError:
+        return {"success": False, "error": "tesseract_not_found", "details": "Binaire tesseract absent."}
+    except Exception as e:
+        return {"success": False, "error": "ocr_failed", "details": str(e)}
+
+
+# ----------------------- EXTRACTION DES LIGNES -----------------------
 def _norm_header_cell(s: str) -> str:
     s = (s or "").strip().lower()
     s = (s.replace("é","e").replace("è","e").replace("ê","e")
@@ -198,15 +198,13 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                     tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
                     if not tbl or len(tbl) < 2:
                         continue
-
                     header = tbl[0]
                     idx = _map_header_indices(header)
                     if not idx:
                         continue
 
                     for line in tbl[1:]:
-                        def get(i):
-                            return line[i] if (i is not None and i < len(line)) else ""
+                        def get(i): return line[i] if (i is not None and i < len(line)) else ""
                         ref   = get(idx.get("ref"))
                         label = get(idx.get("label")) or ref
                         qty   = get(idx.get("qty"))
@@ -231,6 +229,7 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
                             "unit_price": pu_f,
                             "amount":     amt_f
                         })
+        # dédoublonnage
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
@@ -242,108 +241,140 @@ def _parse_lines_with_pdfplumber(pdf_path: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for m in LINE_RX.finditer(text):
+        qty = int(m.group('qty'))
+        pu  = _norm_amount(m.group('pu'))
+        amt = _norm_amount(m.group('amt'))
+        rows.append({
+            "ref":        m.group('ref'),
+            "label":      m.group('label').strip(),
+            "qty":        qty,
+            "unit_price": pu,
+            "amount":     amt
+        })
+    return rows
 
-# =========================
-# OCR image helpers
-# =========================
-def _have_ocr() -> bool:
-    return pytesseract is not None and Image is not None
 
-def _ocr_langs() -> str:
-    return os.getenv("OCR_LANGS", "fra+eng")
-
-def _preprocess_image(img: "Image.Image") -> "Image.Image":
-    # Grayscale
-    g = ImageOps.grayscale(img)
-    # Upscale 3x (améliore nettement Tesseract sur photos d’écran)
-    w, h = g.size
-    scale = 3  # 300%
-    g = g.resize((w*scale, h*scale), Image.Resampling.LANCZOS)
-    # Légère réduction de bruit / lissage
-    g = g.filter(ImageFilter.MedianFilter(size=3))
-    # Binarisation Otsu “approx” (PIL ne fait pas Otsu natif, on fait simple)
-    # On utilise autocontrast qui marche bien sur des factures propres
-    g = ImageOps.autocontrast(g, cutoff=2)
-    # Sharpen léger
-    g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=3))
-    return g
-
-def _ocr_image_to_text(img: "Image.Image") -> str:
-    if not _have_ocr():
-        return ""
-    lang = _ocr_langs()
-    # premier essai psm6
-    cfg = "--oem 3 --psm 6"
-    txt = pytesseract.image_to_string(img, lang=lang, config=cfg) or ""
-    txt = txt.strip()
-    if txt:
-        return txt
-    # deuxième essai : un peu plus zoomé + psm4
-    w, h = img.size
-    zoom = img.resize((int(w*1.33), int(h*1.33)), Image.Resampling.LANCZOS)
-    cfg2 = "--oem 3 --psm 4"
-    txt2 = pytesseract.image_to_string(zoom, lang=lang, config=cfg2) or ""
-    return (txt2 or "").strip()
-
-def _extract_text_from_image(path: Path) -> str:
-    if not _have_ocr():
+# ----------------------- EXTRACTION PRINCIPALE -----------------------
+def _extract_text_from_pdf(path: Path) -> str:
+    if _extract_text is None:
         return ""
     try:
-        with Image.open(path) as im:
-            im = im.convert("RGB")
-            pim = _preprocess_image(im)
-            return _ocr_image_to_text(pim)
+        return _extract_text(str(path)) or ""
     except Exception:
+        # pikepdf peut parfois "réparer" un PDF puis on retente
+        if pikepdf is not None:
+            try:
+                fixed = path.with_suffix(".repaired.pdf")
+                with pikepdf.open(str(path)) as pdf:
+                    pdf.save(str(fixed))
+                return _extract_text(str(fixed)) or ""
+            except Exception:
+                return ""
         return ""
 
-
-# =========================
-# Extraction principale
-# =========================
-def extract_document(path: str | Path, mime: Optional[str] = None) -> Dict[str, Any]:
+def extract_document(path: str, ocr: Optional[str] = None) -> Dict[str, Any]:
     """
-    Route unique : accepte PDF ou image (PNG/JPG).
-    - PDF -> pdfminer/pdfplumber + heuristique
-    - Image -> OCR (pytesseract) + mêmes regex
+    ocr: "auto" (defaut), "force", "off"
+    - PDF texte → pdfminer
+    - Image (png/jpg) → OCR si dispo/autorisé
+    - PDF scanné → si auto & texte vide, on renvoie succès False avec erreur explicite d'OCR manquant
     """
     p = Path(path)
-    ext = p.suffix.lower()
-    is_image = ext in {".png", ".jpg", ".jpeg"}
-    from_images = False
-    ocr_used = False
-    ocr_pages = 0
+    suffix = p.suffix.lower()
+    is_pdf  = suffix == ".pdf"
+    is_img  = suffix in {".png", ".jpg", ".jpeg"}
 
-    # --- obtenir le texte brut
+    ocr_mode = (ocr or "auto").lower()
+    use_ocr = False
     text = ""
-    if is_image:
-        from_images = True
-        if _have_ocr():
-            ocr_used = True
-            text = _extract_text_from_image(p)
-            ocr_pages = 1
-        else:
-            text = ""
-    else:
-        # PDF
-        if _extract_text is not None:
-            text = _extract_text(p) or ""
-        else:
-            text = ""
 
-        # Si texte PDF vide et OCR disponible, on pourrait rasterizer et OCRiser page par page.
-        # (on garde simple ici: uniquement image → OCR ; amélioration possible plus tard)
-        # -> on ne modifie pas ocr_used ici.
-
-    meta = {
+    meta: Dict[str, Any] = {
         "bytes": p.stat().st_size if p.exists() else None,
-        "pages": (text.count("\f") + 1) if (text and not is_image) else (0 if not is_image else 0),
+        "pages": 0,
         "filename": p.name,
-        "from_images": from_images,
-        "ocr_used": ocr_used,
-        "ocr_pages": ocr_pages
     }
 
-    # Champs simples
+    # --- Route image ---
+    if is_img:
+        meta["from_images"] = True
+        meta["ocr_used"] = True
+        ocr_res = _ocr_image_to_text(p)
+        if not ocr_res.get("success"):
+            return {
+                "success": False,
+                "error": ocr_res.get("error") or "ocr_failed",
+                "details": ocr_res.get("details"),
+                "meta": meta,
+                "fields": {
+                    "invoice_number": None, "invoice_date": None,
+                    "total_ht": None, "total_tva": None, "total_ttc": None,
+                    "currency": "EUR",
+                },
+                "text": "", "text_preview": ""
+            }
+        text = ocr_res.get("text", "") or ""
+        meta["ocr_pages"] = 1
+        # on n'a pas d'info "pages" pour image unique
+        meta["pages"] = 0
+
+    # --- Route PDF ---
+    elif is_pdf:
+        text = _extract_text_from_pdf(p)
+        meta["pages"] = (text.count("\f") + 1) if text else 0
+        if (ocr_mode in ("force",)) or (ocr_mode in ("auto", None) and not text.strip()):
+            # PDF scanné → proposer OCR (mais on ne rasterize pas pages ici pour rester léger)
+            # On signale clairement l’absence d’OCR si tesseract/PIL manquent
+            if pytesseract is None or Image is None:
+                return {
+                    "success": False,
+                    "error": "tesseract_not_found",
+                    "details": "OCR requis (PDF scanné) mais Tesseract/PIL indisponibles.",
+                    "meta": {**meta, "ocr_used": True},
+                    "fields": {
+                        "invoice_number": None, "invoice_date": None,
+                        "total_ht": None, "total_tva": None, "total_ttc": None,
+                        "currency": "EUR",
+                    },
+                    "text": "", "text_preview": ""
+                }
+            # Si on veut aller plus loin, il faudrait rasterizer les pages en images puis OCR.
+            # Ici on reste explicite : OCR non implémenté pour PDF multipage scanné.
+            return {
+                "success": False,
+                "error": "pdf_scanned_no_raster",
+                "details": "Le PDF semble scanné. Implémente la rasterization + OCR pour continuer.",
+                "meta": {**meta, "ocr_used": True},
+                "fields": {
+                    "invoice_number": None, "invoice_date": None,
+                    "total_ht": None, "total_tva": None, "total_ttc": None,
+                    "currency": "EUR",
+                },
+                "text": "", "text_preview": ""
+            }
+    else:
+        return {
+            "success": False,
+            "error": "unsupported_file",
+            "details": f"Extension non supportée: {suffix}",
+            "meta": meta,
+            "fields": {
+                "invoice_number": None, "invoice_date": None,
+                "total_ht": None, "total_tva": None, "total_ttc": None,
+                "currency": "EUR",
+            },
+            "text": "", "text_preview": ""
+        }
+
+    # ---------------- Champs simples ----------------
+    currency = None
+    if re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
+    elif re.search(r"\bGBP\b|£", text, re.I): currency = "GBP"
+    elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
+    elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
+
     m_num = NUM_RE.search(text)
     invoice_number = m_num.group(1).strip() if m_num else None
 
@@ -358,16 +389,10 @@ def extract_document(path: str | Path, mime: Optional[str] = None) -> Dict[str, 
     m_total = TOTAL_RE.search(text)
     total_ttc = _norm_amount(m_total.group(1)) if m_total else None
     if total_ttc is None:
-        amounts = [_norm_amount(a) for a in EUR_RE.findall(text)]
-        amounts = [a for a in amounts if a is not None]
-        if amounts:
-            total_ttc = max(amounts)
-
-    currency = None
-    if re.search(r"\bEUR\b|€", text, re.I): currency = "EUR"
-    elif re.search(r"\bGBP\b|£", text, re.I): currency = "GBP"
-    elif re.search(r"\bCHF\b", text, re.I): currency = "CHF"
-    elif re.search(r"\bUSD\b|\$", text, re.I): currency = "USD"
+        amts = [_norm_amount(a) for a in EUR_RE.findall(text)]
+        amts = [a for a in amts if a is not None]
+        if amts:
+            total_ttc = max(amts)
 
     vat_rate = None
     m_vat = VAT_RATE_RE.search(text)
@@ -386,25 +411,23 @@ def extract_document(path: str | Path, mime: Optional[str] = None) -> Dict[str, 
             "total_ttc": total_ttc,
             "currency":  currency or "EUR",
         },
-        "text": text[:20000] if text else "",
-        "text_preview": text[:2000] if text else "",
+        "text": text[:20000],
+        "text_preview": text[:2000],
     }
     fields = result["fields"]
 
-    # Blocs parties
+    # Vendeur / Client
     m = SELLER_BLOCK.search(text)
     if m and not fields.get("seller"):
         fields["seller"] = _clean_block(m.group('blk'))
-
     m = CLIENT_BLOCK.search(text)
     if m and not fields.get("buyer"):
         fields["buyer"] = _clean_block(m.group('blk'))
 
-    # Identifiants FR (vendeur)
+    # Identifiants
     m = TVA_RE.search(text)
     if m and not fields.get("seller_tva"):
         fields["seller_tva"] = m.group(0).replace(' ', '')
-
     m = SIRET_RE.search(text)
     if m and not fields.get("seller_siret"):
         fields["seller_siret"] = m.group(0)
@@ -412,30 +435,27 @@ def extract_document(path: str | Path, mime: Optional[str] = None) -> Dict[str, 
         m2 = SIREN_RE.search(text)
         if m2:
             fields["seller_siret"] = m2.group(0)
-
     m = IBAN_RE.search(text)
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
 
-    # Lignes d'articles : sur PDF on tente pdfplumber + fallback regex.
+    # ---------------- LIGNES ----------------
     lines: List[Dict[str, Any]] = []
-    if not is_image:
+    # pdfplumber d’abord (PDF uniquement)
+    if is_pdf:
         try:
             lines = _parse_lines_with_pdfplumber(str(p))
         except Exception:
             lines = []
-        if not lines:
-            lines = _parse_lines(text)
-    else:
-        # Image OCR -> uniquement regex (on n’a pas de structure tableau)
+    # fallback regex
+    if not lines and text:
         lines = _parse_lines(text)
 
     if lines:
         result["lines"] = lines
         fields["lines_count"] = len(lines)
 
-        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2) if lines else None
-
+        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
         if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
             total_ht, total_tva, total_ttc2 = _infer_totals(total_ttc, None, None, vat_rate)
             fields["total_ht"]  = total_ht
@@ -449,3 +469,8 @@ def extract_document(path: str | Path, mime: Optional[str] = None) -> Dict[str, 
             if tt is not None: fields["total_ttc"] = tt
 
     return result
+
+
+# ---- Alias rétro-compatibilité : ne casse pas les imports existants ----
+def extract_pdf(path: str, **kwargs):
+    return extract_document(path, **kwargs)
