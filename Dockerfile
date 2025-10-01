@@ -1,29 +1,30 @@
 # Dockerfile
-FROM python:3.13-slim
+FROM python:3.12-slim
 
-# — Dépendances système nécessaires pour l’OCR et les conversions —
+# 1) Paquets système nécessaires
+# - tesseract-ocr + fra : OCR FR
+# - qpdf : runtime pikepdf
+# - libglib2.0-0 : dépendance fréquente pillow/pdfplumber
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
-    tesseract-ocr-fra \
-    poppler-utils \
-    libjpeg62-turbo \
-    libpng16-16 \
-    ghostscript \
+    tesseract-ocr tesseract-ocr-fra \
+    qpdf libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
-# Variables env utiles
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata \
+# 2) Variables d'env utiles
+ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    LC_ALL=C.UTF-8
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
+# 3) Dépendances Python
 WORKDIR /app
-
-# — Dépendances Python —
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# — Code de l’app —
+# 4) Code
 COPY . .
 
-# Gunicorn avec un timeout un peu plus généreux (OCR peut être plus lent)
-CMD ["gunicorn","app.main:app","--bind","0.0.0.0:${PORT:-8000}","--timeout","120","--workers","2","--threads","4"]
+# 5) Port Render
+ENV PORT=10000
+
+# 6) Démarrage
+CMD ["gunicorn", "app.main:app", "--bind", "0.0.0.0:10000"]
