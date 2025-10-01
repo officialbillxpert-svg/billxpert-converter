@@ -25,6 +25,34 @@ app = Flask(__name__)
 CORS(app)
 
 
+# --- DIAG TESSERACT (temporaire) ---
+@app.get("/diag")
+def diag():
+    import shutil, subprocess, os
+    try:
+        import pytesseract
+        pt_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
+    except Exception:
+        pytesseract = None
+        pt_cmd = None
+
+    which = shutil.which("tesseract")
+    langs, err = None, None
+    try:
+        out = subprocess.check_output(["tesseract","--list-langs"], stderr=subprocess.STDOUT, text=True)
+        langs = [l.strip() for l in out.splitlines() if l.strip() and not l.lower().startswith("list of")]
+    except Exception as e:
+        err = str(e)
+
+    return jsonify({
+        "which_tesseract": which,
+        "pytesseract_cmd": pt_cmd,
+        "TESSDATA_PREFIX": os.environ.get("TESSDATA_PREFIX"),
+        "langs": langs,
+        "list_langs_error": err,
+    })
+
+
 def _save_upload_to_tmp() -> Path:
     """Sauvegarde l’upload multipart dans /tmp en conservant l’extension.
     Lève une ValueError si pas de fichier ou ext non supportée.
