@@ -34,7 +34,7 @@ TOTAL_TTC_NEAR_RE = re.compile(
     re.I
 )
 TOTAL_HT_NEAR_RE = re.compile(r'Total\s*HT[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
-TVA_NEAR_RE      = re.compile(r'\bTVA\b[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
+TVA_NEAR_RE = re.compile(r'\bTVA\b[\s\S]{0,120}?([0-9][0-9\.\,\s]+)\s*€?', re.I)
 
 # fallback stricte avec décimales (évite IBAN)
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
@@ -555,6 +555,14 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
                 if tv is not None: fields["total_tva"] = tv
                 if tt is not None: fields["total_ttc"] = tt
 
+        # Post-pass cohérence TVA (branche image)
+        if (fields.get("total_tva") is None 
+            and fields.get("total_ttc") is not None 
+            and fields.get("total_ht")  is not None):
+            diff = round(fields["total_ttc"] - fields["total_ht"], 2)
+            if 0 <= diff <= 2_000_000:
+                fields["total_tva"] = diff
+
         return result  # fin de la branche images
 
     # --- PDF ---
@@ -599,6 +607,14 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if th is not None: fields["total_ht"]  = th
             if tv is not None: fields["total_tva"] = tv
             if tt is not None: fields["total_ttc"] = tt
+
+    # Post-pass cohérence TVA (branche PDF)
+    if (fields.get("total_tva") is None 
+        and fields.get("total_ttc") is not None 
+        and fields.get("total_ht")  is not None):
+        diff = round(fields["total_ttc"] - fields["total_ht"], 2)
+        if 0 <= diff <= 2_000_000:
+            fields["total_tva"] = diff
 
     return result  # fin de la branche PDF
 
