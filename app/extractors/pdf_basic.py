@@ -446,18 +446,63 @@ def _pdf_text(path: Union[str, Path]) -> str:
     except Exception:
         return ""
 
+# --- remplace TOUT votre bloc OCR image par ceci ---
+
 def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[str, Dict[str, Any]]:
-    if pytesseract is None or Image is None:
-        return "", {"error": "tesseract_not_found", "details": "Binaire tesseract absent."}
+    """
+    OCR robuste pour PNG/JPG.
+    - Force le binaire tesseract si dispo
+    - Pré-traitement binaire (meilleure lisibilité)
+    - Fallback lang: fra+eng -> eng
+    - Retourne des détails d'erreur utiles
+    """
+    # Dépendances vérifiées ?
+    if pytesseract is None or Image is None or ImageOps is None:
+        return "", {"error": "tesseract_not_found", "details": "Binaire tesseract ou Pillow manquant."}
+
+    # Force le chemin tesseract si connu
     try:
-        img = Image.open(str(path))
-        img = ImageOps.grayscale(img)
-        txt = pytesseract.image_to_string(img, lang=lang) or ""
-        return txt, {}
-    except pytesseract.TesseractNotFoundError:
-        return "", {"error": "tesseract_not_found", "details": "Binaire tesseract absent."}
-    except Exception as e:
-        return "", {"error": "ocr_failed", "details": f"{type(e).__name__}: {e}"}
+        import shutil
+        tpath = shutil.which("tesseract")
+        if tpath:
+            pytesseract.pytesseract.tesseract_cmd = tpath
+    except Exception:
+        pass
+
+    # Prépare un petit helper de pré-traitement
+    def preprocess(img: "Image.Image") -> "Image.Image":
+        # passage en niveaux de gris + contraste binaire
+        g = ImageOps.grayscale(img)
+        # binarisation simple (threshold 180)
+        return g.point(lambda x: 255 if x > 180 else 0, mode="1")
+
+    tried: List[str] = []
+    last_err: Optional[str] = None
+
+    # ordre d'essai pour les langues
+    for l in [lang, "eng"]:
+        if not l:
+            continue
+        tried.append(l)
+        try:
+            img = Image.open(str(path))
+            img = preprocess(img)
+            txt = pytesseract.image_to_string(img, lang=l) or ""
+            if txt.strip():
+                return txt, {"ocr_lang": l}
+            # si vide, on continue sur la langue suivante
+        except pytesseract.TesseractNotFoundError:
+            return "", {"error": "tesseract_not_found", "details": "Binaire tesseract absent."}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            # on tente la langue suivante
+
+    # Si on arrive ici = échec
+    return "", {
+        "error": "ocr_failed",
+        "details": last_err or "OCR vide.",
+        "tried_langs": tried
+    }
 
 # ---------- Public ----------
 def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
