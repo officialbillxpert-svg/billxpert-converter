@@ -26,13 +26,17 @@ PATTERNS_VERSION = "v2025-10-02b"
 
 # ---------- Regex ----------
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
+INVOICE_NUM_RE = re.compile(r'Num[ée]ro\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
 
 TOTAL_TTC_NEAR_RE = re.compile(
     r'(?:Total\s*(?:TTC)?|Grand\s*total|Total\s*amount|Total\s*à\s*payer)[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
+TOTAL_HT_NEAR_RE = re.compile(r'Total\s*HT[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
+TVA_NEAR_RE      = re.compile(r'\bTVA\b[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
 
+# fallback stricte avec décimales (évite IBAN)
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
 
 SIRET_RE = re.compile(r'\b\d{14}\b')
@@ -49,6 +53,7 @@ CLIENT_BLOCK = re.compile(
     re.I | re.S
 )
 
+# fallback lignes (texte “brut”)
 LINE_RX = re.compile(
     r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
     r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
@@ -65,23 +70,32 @@ TABLE_HEADER_HINTS = [
     ("montant", "total", "amount")
 ]
 
+# bruit / pied de page à ignorer dans les lignes
 FOOTER_NOISE_PAT = re.compile(r'(merci|paiement|iban|file://|conditions|due date|bank|html)', re.I)
 
 # ---------- Helpers ----------
 def _norm_amount(s: str) -> Optional[float]:
+    """Normalise un montant. Ignore IBAN/numéros/absurdités."""
     if not s:
         return None
     s = s.strip()
+
+    # Longue séquence de chiffres sans séparateur décimal et sans €
     digits_only = re.sub(r'\D', '', s)
     if (len(digits_only) >= 11) and ('€' not in s) and (',' not in s) and ('.' not in s):
         return None
+
+    # IBAN-like
     if re.search(r'\b\d{4}\s\d{4}\s\d{4}\s\d{4}', s):
         return None
+
     s = s.replace(' ', '')
+    # "1.234,56" -> "1234.56"
     if ',' in s and '.' in s:
         s = s.replace('.', '').replace(',', '.')
     elif ',' in s:
         s = s.replace(',', '.')
+
     try:
         val = float(s)
         if val < 0 or val > 2_000_000:
@@ -120,7 +134,9 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
     rate = float(str(vat_rate).replace(',', '.')) / 100.0
+
     ht, tva, ttc = total_ht, total_tva, total_ttc
+
     if ttc is not None and (ht is None or tva is None):
         try:
             ht_calc = round(ttc / (1.0 + rate), 2)
@@ -129,6 +145,7 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
             if tva is None: tva = tva_calc
         except Exception:
             pass
+
     if ht is not None and (ttc is None or tva is None):
         try:
             tva_calc = round(ht * rate, 2)
@@ -137,11 +154,13 @@ def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[fl
             if ttc is None: ttc = ttc_calc
         except Exception:
             pass
+
     if ttc is not None and tva is not None and ht is None:
         try:
             ht = round(ttc - tva, 2)
         except Exception:
             pass
+
     return ht, tva, ttc
 
 def _norm_header_cell(s: str) -> str:
@@ -155,17 +174,20 @@ def _norm_header_cell(s: str) -> str:
 def _map_header_indices(headers: List[str]) -> Optional[Dict[str, int]]:
     idx: Dict[str, Optional[int]] = {}
     norm = [_norm_header_cell(h) for h in headers]
+
     def match_one(*cands):
         for i, h in enumerate(norm):
             for c in cands:
                 if c in h:
                     return i
         return None
+
     idx["ref"]    = match_one(*TABLE_HEADER_HINTS[0])
     idx["label"]  = match_one(*TABLE_HEADER_HINTS[1])
     idx["qty"]    = match_one(*TABLE_HEADER_HINTS[2])
     idx["unit"]   = match_one(*TABLE_HEADER_HINTS[3])
     idx["amount"] = match_one(*TABLE_HEADER_HINTS[4])
+
     if all(v is None for v in idx.values()):
         return None
     return {k: v for k, v in idx.items() if v is not None}
@@ -181,14 +203,20 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                 words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
                 if not words:
                     continue
+
+                # indexation des mots par "ligne" approx.
                 lines_by_y: Dict[int, List[dict]] = {}
                 for w in words:
                     mid_y = int((w["top"] + w["bottom"]) / 2)
                     lines_by_y.setdefault(mid_y, []).append(w)
+
                 header_y = None
                 header_cells: Dict[str, dict] = {}
+
                 def norm(s: str) -> str:
                     return _norm_header_cell(s)
+
+                # 1) repérage header
                 for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
                     score, hitmap = 0, {}
                     for w in ws:
@@ -204,6 +232,8 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         break
                 if header_y is None:
                     continue
+
+                # 2) repérage d’une ligne "total" = fin du tableau
                 total_y = None
                 for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
                     if yk <= header_y:
@@ -212,6 +242,8 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                     if "total" in txt:
                         total_y = yk
                         break
+
+                # 3) bornes X des colonnes depuis les en-têtes
                 cols = []
                 for role in ["ref", "label", "qty", "unit", "amount"]:
                     if role in header_cells:
@@ -220,6 +252,7 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                 cols = sorted(cols, key=lambda t: t[1])
                 if not cols:
                     continue
+
                 col_bounds: List[Tuple[str, float, float]] = []
                 for i, (role, xmid) in enumerate(cols):
                     if i == 0:
@@ -232,12 +265,15 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         left = (cols[i-1][1] + xmid) / 2
                         right = (cols[i+1][1] + xmid) / 2
                     col_bounds.append((role, left, right))
+
+                # 4) lignes du corps = entre header_y et total_y
                 def in_body(yk: int) -> bool:
                     if yk <= header_y + 5:
                         return False
                     if total_y is not None and yk >= total_y - 5:
                         return False
                     return True
+
                 bands: List[Tuple[int, List[dict]]] = []
                 for yk in sorted(lines_by_y.keys()):
                     if not in_body(yk):
@@ -251,10 +287,13 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                             last_ws.extend(ws)
                         else:
                             bands.append((yk, ws))
+
+                # 5) projection vers colonnes + filtres
                 for _, ws in bands:
                     full_text = " ".join(w["text"] for w in ws)
                     if FOOTER_NOISE_PAT.search(full_text):
                         continue
+
                     cells: Dict[str, List[str]] = {role: [] for (role, _, _) in col_bounds}
                     for w in ws:
                         xmid = (w["x0"] + w["x1"]) / 2
@@ -262,11 +301,13 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                             if left <= xmid < right:
                                 cells[role].append(w["text"])
                                 break
+
                     ref   = " ".join(cells.get("ref", [])).strip() or None
                     label = " ".join(cells.get("label", [])).strip() or None
                     qtys  = " ".join(cells.get("qty", [])).strip()
                     pu    = " ".join(cells.get("unit", [])).strip()
                     amt   = " ".join(cells.get("amount", [])).strip()
+
                     def _to_int(s: str) -> Optional[int]:
                         s2 = re.sub(r"[^\d]", "", s or "")
                         if not s2:
@@ -278,21 +319,32 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                             return val
                         except Exception:
                             return None
+
                     qty_i  = _to_int(qtys)
                     pu_f   = _norm_amount(pu)
                     amt_f  = _norm_amount(amt)
+
                     if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
                         continue
+
+                    # si rien d’exploitable, on zappe
                     if not (label or pu_f is not None or amt_f is not None or qty_i is not None or ref):
                         continue
+
                     if (not label) and ref:
                         label = ref
+
                     if amt_f is None and (pu_f is not None) and (qty_i is not None):
                         amt_f = round(pu_f * qty_i, 2)
+
+                    # “Qte seule” sans libellé/prix/montant => skip (typiquement “30” de “Paiement sous 30 jours”)
                     if (qty_i is not None) and (not label) and (pu_f is None) and (amt_f is None):
                         continue
+
+                    # - ligne dont label ressemble à du bruit (file://, html)
                     if label and FOOTER_NOISE_PAT.search(label):
                         continue
+
                     rows.append({
                         "ref":        ref,
                         "label":      label or "",
@@ -300,6 +352,8 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         "unit_price": pu_f,
                         "amount":     amt_f
                     })
+
+        # dédoublonnage
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
@@ -323,6 +377,7 @@ def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
                 if t: tables.append(t)
                 t2 = page.extract_table({"vertical_strategy":"lines", "horizontal_strategy":"lines"})
                 if t2: tables.append(t2)
+
                 for tbl in tables:
                     tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
                     if not tbl or len(tbl) < 2:
@@ -331,6 +386,7 @@ def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
                     idx = _map_header_indices(header)
                     if not idx:
                         continue
+
                     for line in tbl[1:]:
                         def get(i: Optional[int]) -> str:
                             return line[i] if (i is not None and i < len(line)) else ""
@@ -339,20 +395,24 @@ def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
                         qty   = get(idx.get("qty"))
                         pu    = get(idx.get("unit"))
                         amt   = get(idx.get("amount"))
+
                         try:
                             qty_i = int(re.sub(r"[^\d]", "", qty)) if qty else None
                             if qty_i is not None and (qty_i < 0 or qty_i > 999):
                                 qty_i = None
                         except Exception:
                             qty_i = None
+
                         pu_f  = _norm_amount(pu)
                         amt_f = _norm_amount(amt)
                         if amt_f is None and pu_f is not None and qty_i is not None:
                             amt_f = round(pu_f * qty_i, 2)
+
                         if not (label or pu_f is not None or amt_f is not None or qty_i is not None):
                             continue
                         if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
                             continue
+
                         rows.append({
                             "ref":        (ref or "").strip() or None,
                             "label":      (label or "").strip(),
@@ -360,6 +420,7 @@ def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
                             "unit_price": pu_f,
                             "amount":     amt_f
                         })
+
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
@@ -379,8 +440,14 @@ def _pdf_text(path: Union[str, Path]) -> str:
         return ""
 
 def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[str, Dict[str, Any]]:
+    """
+    OCR robuste pour PNG/JPG.
+    Toujours renvoyer un dict d'erreur au lieu de lever une exception.
+    """
     if pytesseract is None or Image is None or ImageOps is None:
         return "", {"error": "tesseract_not_found", "details": "Binaire tesseract ou Pillow manquant."}
+
+    # Force le chemin tesseract si dispo
     try:
         import shutil
         tpath = shutil.which("tesseract")
@@ -388,11 +455,14 @@ def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[s
             pytesseract.pytesseract.tesseract_cmd = tpath
     except Exception:
         pass
+
     def preprocess(img: "Image.Image") -> "Image.Image":
         g = ImageOps.grayscale(img)
         return g.point(lambda x: 255 if x > 180 else 0, mode="1")
+
     tried: List[str] = []
     last_err: Optional[str] = None
+
     for l in [lang, "eng"]:
         if not l:
             continue
@@ -409,6 +479,7 @@ def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[s
             return "", {"error": "tesseract_not_found", "details": "Binaire tesseract absent."}
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
+
     return "", {"error": "ocr_failed", "details": last_err or "OCR vide.", "tried_langs": tried}
 
 # ---------- Public ----------
@@ -441,21 +512,50 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # --- images -> OCR ---
+    # --- IMAGES -> OCR ---
     if ext in {".png", ".jpg", ".jpeg"}:
         txt, info = _ocr_image_to_text(p, lang="fra+eng")
+
         if info.get("error"):
             result["success"] = False
             result.update(info)
             return result
+
         result["meta"]["ocr_used"] = True
         result["meta"]["ocr_pages"] = 1
         if "ocr_lang" in info:
             result["meta"]["ocr_lang"] = info["ocr_lang"]
+
         result["text"] = txt[:20000]
         result["text_preview"] = txt[:2000]
+
         _fill_fields_from_text(result, txt)
-        return result
+
+        # Lignes depuis le texte OCR (regex)
+        lines = _parse_lines_regex(txt)
+        if lines:
+            result["lines"] = lines
+            result["meta"]["line_strategy"] = "regex"
+            fields["lines_count"] = len(lines)
+
+            # Recalcule/cohérence des totaux
+            vat_rate  = _extract_vat_rate(txt)
+            total_ttc = fields.get("total_ttc")
+            sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
+
+            if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
+                th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
+                if th is not None: fields["total_ht"]  = th
+                if tv is not None: fields["total_tva"] = tv
+                fields["total_ttc"] = tt or total_ttc
+            else:
+                total_ht = sum_lines if sum_lines else fields.get("total_ht")
+                th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
+                if th is not None: fields["total_ht"]  = th
+                if tv is not None: fields["total_tva"] = tv
+                if tt is not None: fields["total_ttc"] = tt
+
+        return result  # fin de la branche images
 
     # --- PDF ---
     text = _pdf_text(p) or ""
@@ -483,9 +583,11 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
     if lines:
         fields["lines_count"] = len(lines)
-        vat_rate = _extract_vat_rate(text)
+
+        vat_rate  = _extract_vat_rate(text)
         total_ttc = fields.get("total_ttc")
         sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
+
         if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
             th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
             fields["total_ht"]  = th
@@ -498,8 +600,9 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tv is not None: fields["total_tva"] = tv
             if tt is not None: fields["total_ttc"] = tt
 
-    return result
+    return result  # fin de la branche PDF
 
+# ---------- Extract VAT rate ----------
 def _extract_vat_rate(text: str) -> Optional[str]:
     m_vat = VAT_RATE_RE.search(text or "")
     if not m_vat:
@@ -507,10 +610,17 @@ def _extract_vat_rate(text: str) -> Optional[str]:
     vr = m_vat.group(1)
     return '5.5' if vr in ('5,5', '5.5') else vr
 
+# ---------- Remplissage des champs ----------
 def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
     fields = result["fields"]
-    m_num = NUM_RE.search(text or "")
+
+    # Numéro (essaie d'abord "Numéro :", puis fallback générique)
+    m_num = INVOICE_NUM_RE.search(text or "")
+    if not m_num:
+        m_num = NUM_RE.search(text or "")
     fields["invoice_number"] = m_num.group(1).strip() if m_num else None
+
+    # Date
     m_date = DATE_RE.search(text or "")
     if m_date:
         try:
@@ -518,6 +628,8 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
             fields["invoice_date"] = dateparser.parse(m_date.group(1), dayfirst=True).date().isoformat()
         except Exception:
             fields["invoice_date"] = None
+
+    # Total TTC (priorité : près de “Total …”)
     total_ttc = None
     near = TOTAL_TTC_NEAR_RE.findall(text or "")
     if near:
@@ -527,19 +639,41 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
         if m_strict:
             total_ttc = _norm_amount(m_strict[-1])
     fields["total_ttc"] = total_ttc
+
+    # Total HT
+    m_ht = TOTAL_HT_NEAR_RE.search(text or "")
+    if m_ht:
+        ht_val = _norm_amount(m_ht.group(1))
+        if ht_val is not None:
+            fields["total_ht"] = ht_val
+
+    # TVA (montant)
+    m_tva = TVA_NEAR_RE.search(text or "")
+    if m_tva:
+        tva_val = _norm_amount(m_tva.group(1))
+        if tva_val is not None:
+            fields["total_tva"] = tva_val
+
+    # currency
     if re.search(r"\bEUR\b|€", text, re.I): fields["currency"] = "EUR"
     elif re.search(r"\bGBP\b|£", text, re.I): fields["currency"] = "GBP"
     elif re.search(r"\bCHF\b", text, re.I): fields["currency"] = "CHF"
     elif re.search(r"\bUSD\b|\$", text, re.I): fields["currency"] = "USD"
+
+    # seller / buyer (blocs)
     m = SELLER_BLOCK.search(text or "")
     if m and not fields.get("seller"):
         fields["seller"] = _clean_block(m.group('blk'))
+
     m = CLIENT_BLOCK.search(text or "")
     if m and not fields.get("buyer"):
         fields["buyer"] = _clean_block(m.group('blk'))
+
+    # ids FR
     m = TVA_RE.search(text or "")
     if m and not fields.get("seller_tva"):
         fields["seller_tva"] = m.group(0).replace(' ', '')
+
     m = SIRET_RE.search(text or "")
     if m and not fields.get("seller_siret"):
         fields["seller_siret"] = m.group(0)
@@ -547,6 +681,7 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
         m2 = SIREN_RE.search(text or "")
         if m2:
             fields["seller_siret"] = m2.group(0)
+
     m = IBAN_RE.search(text or "")
     if m and not fields.get("seller_iban"):
         fields["seller_iban"] = m.group(0).replace(' ', '')
