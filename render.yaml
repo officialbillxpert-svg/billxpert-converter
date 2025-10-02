@@ -3,6 +3,5 @@ services:
     name: billxpert-converter
     env: docker
     plan: free
-    dockerfilePath: ./Dockerfile
-    autoDeploy: true
     healthCheckPath: /healthz
+    autoDeploy: true
