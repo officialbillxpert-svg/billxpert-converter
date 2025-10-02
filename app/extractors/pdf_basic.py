@@ -1,20 +1,17 @@
 # app/extractors/pdf_basic.py
 from __future__ import annotations
-import io
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# --- PDF texte (pdfminer) ---
 from pdfminer.high_level import extract_text as _pdfminer_extract_text
 
-# --- pdfplumber (tables + words + positions) ---
 try:
-    import pdfplumber  # optional but strongly recommended
+    import pdfplumber
 except Exception:
     pdfplumber = None  # type: ignore
 
-# --- OCR images (PNG/JPG) ---
+# OCR images (PNG/JPG)
 try:
     import pytesseract
     from PIL import Image, ImageOps
@@ -23,16 +20,14 @@ except Exception:
     Image = None  # type: ignore
     ImageOps = None  # type: ignore
 
-# --------------------------------------------------------------------
-# Regex & Hints
-# --------------------------------------------------------------------
+# ---------- Regex ----------
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
-TOTAL_RE = re.compile(
-    r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)\s*[:€]*\s*([0-9][0-9\.\,\s]+)',
-    re.I
-)
-EUR_RE   = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2})?)')
+TOTAL_LINE_RE = re.compile(r'\bTotal\b.*', re.I)
+TOTAL_VAL_NEAR = re.compile(r'(?:Total\s*(?:TTC)?|Montant\s*TTC|Total\s*à\s*payer|Grand\s*total|Total\s*amount)[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
+
+# plus strict que l’ancien pour éviter l’IBAN : on veut soit un € soit une virgule (décimales fr)
+EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
 
 SIRET_RE = re.compile(r'\b\d{14}\b')
 SIREN_RE = re.compile(r'(?<!\d)\d{9}(?!\d)')
@@ -48,6 +43,7 @@ CLIENT_BLOCK = re.compile(
     re.I | re.S
 )
 
+# tolérant, reste utile en dernier recours
 LINE_RX = re.compile(
     r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
     r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
@@ -64,19 +60,27 @@ TABLE_HEADER_HINTS = [
     ("montant", "total", "amount")
 ]
 
-# --------------------------------------------------------------------
-# Helpers simples
-# --------------------------------------------------------------------
+FOOTER_NOISE_PAT = re.compile(r'(merci|paiement|iban|file://|conditions|due date|bank)', re.I)
+
+# ---------- Helpers ----------
 def _norm_amount(s: str) -> Optional[float]:
     if not s:
         return None
-    s = s.strip().replace(' ', '')
+    s = s.strip()
+    # refuse les absurdités type séquences de >10 chiffres sans séparateur décimal ni €
+    digits_only = re.sub(r'\D', '', s)
+    if (len(digits_only) >= 11) and ('€' not in s) and (',' not in s) and ('.' not in s):
+        return None
+    s = s.replace(' ', '')
     if ',' in s and '.' in s:
         s = s.replace('.', '').replace(',', '.')
     elif ',' in s:
         s = s.replace(',', '.')
     try:
-        return round(float(s), 2)
+        val = float(s)
+        if val < 0 or val > 2_000_000:  # garde-fou simple
+            return None
+        return round(val, 2)
     except Exception:
         return None
 
@@ -166,17 +170,10 @@ def _map_header_indices(headers: List[str]) -> Optional[Dict[str, int]]:
         return None
     return {k: v for k, v in idx.items() if v is not None}
 
-# --------------------------------------------------------------------
-# pdfplumber – stratégie 1 : par positions X/Y (robuste)
-# --------------------------------------------------------------------
+# ---------- pdfplumber: X/Y robuste avec coupe avant "Totals" ----------
 def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
-    """
-    Reconstitue le tableau d’articles en lisant les mots positionnés sous les en-têtes.
-    Très robuste quand le texte est éclaté (chaque cellule séparée).
-    """
     if pdfplumber is None:
         return []
-
     rows: List[Dict[str, Any]] = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -185,60 +182,55 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                 if not words:
                     continue
 
-                # Chercher la ligne d’en-têtes : on repère la présence de mots-clés
-                # On groupe les words par bande horizontale (ligne approximative)
+                # indexation des mots par "ligne" approximative
                 lines_by_y: Dict[int, List[dict]] = {}
                 for w in words:
                     mid_y = int((w["top"] + w["bottom"]) / 2)
                     lines_by_y.setdefault(mid_y, []).append(w)
 
-                header_line_y = None
+                header_y = None
                 header_cells: Dict[str, dict] = {}
 
-                def norm(wtxt: str) -> str:
-                    return _norm_header_cell(wtxt)
+                def norm(s: str) -> str:
+                    return _norm_header_cell(s)
 
-                for ykey, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
-                    txts = [norm(w["text"]) for w in sorted(ws, key=lambda w: w["x0"])]
-                    txt = " ".join(txts)
-                    # Un peu souple : on veut au moins 2-3 indices d’en-tête présents
-                    score = 0
-                    hitmap: Dict[str, dict] = {}
+                # 1) repérage de la ligne d'en-têtes
+                for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
+                    score, hitmap = 0, {}
                     for w in ws:
                         t = norm(w["text"])
-                        if any(c in t for c in TABLE_HEADER_HINTS[2]):  # qty
-                            score += 1; hitmap["qty"] = w
-                        if any(c in t for c in TABLE_HEADER_HINTS[3]):  # unit price
-                            score += 1; hitmap["unit"] = w
-                        if any(c in t for c in TABLE_HEADER_HINTS[4]):  # amount
-                            score += 1; hitmap["amount"] = w
-                        if any(c in t for c in TABLE_HEADER_HINTS[1]):  # label
-                            score += 1; hitmap["label"] = w
-                        if any(c in t for c in TABLE_HEADER_HINTS[0]):  # ref
-                            score += 1; hitmap["ref"] = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[2]): score += 1; hitmap["qty"]   = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[3]): score += 1; hitmap["unit"]  = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[4]): score += 1; hitmap["amount"]= w
+                        if any(c in t for c in TABLE_HEADER_HINTS[1]): score += 1; hitmap["label"] = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[0]): score += 1; hitmap["ref"]   = w
                     if score >= 3:
-                        header_line_y = ykey
+                        header_y = yk
                         header_cells = hitmap
                         break
-
-                if header_line_y is None:
-                    # Impossible de trouver des headers → page suivante
+                if header_y is None:
                     continue
 
-                # Définir les frontières X des colonnes à partir des mots d’en-têtes trouvés
-                # On ordonne par x0 croissant
+                # 2) repérage d'une ligne "Total ..." -> bornage vertical de fin
+                total_y = None
+                for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
+                    if yk <= header_y:
+                        continue
+                    txt = " ".join(norm(w["text"]) for w in ws)
+                    if "total" in txt:
+                        total_y = yk
+                        break
+
+                # 3) bornes X des colonnes à partir des cellules d’en-tête
                 cols = []
                 for role in ["ref", "label", "qty", "unit", "amount"]:
                     if role in header_cells:
                         w = header_cells[role]
                         cols.append((role, (w["x0"] + w["x1"]) / 2))
-                # Si on n'a pas tout, on comble en se basant sur la distribution x
                 cols = sorted(cols, key=lambda t: t[1])
-
                 if not cols:
                     continue
 
-                # Construire des bornes [x_left, x_right) par rôle
                 col_bounds: List[Tuple[str, float, float]] = []
                 for i, (role, xmid) in enumerate(cols):
                     if i == 0:
@@ -252,25 +244,33 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         right = (cols[i+1][1] + xmid) / 2
                     col_bounds.append((role, left, right))
 
-                # Toutes les lignes sous l’en-tête (y > header_line_y + petite marge)
-                body_lines = {yk: ws for yk, ws in lines_by_y.items() if yk > header_line_y + 5}
+                # 4) corps du tableau = entre header_y et total_y (si trouvé)
+                def in_body(yk: int) -> bool:
+                    if yk <= header_y + 5:
+                        return False
+                    if total_y is not None and yk >= total_y - 5:
+                        return False
+                    return True
 
-                # Grouper par bandes (tolérance verticale)
-                # On construit des groupes en fusionnant les y proches
                 bands: List[Tuple[int, List[dict]]] = []
-                for yk in sorted(body_lines.keys()):
-                    ws = sorted(body_lines[yk], key=lambda w: w["x0"])
+                for yk in sorted(lines_by_y.keys()):
+                    if not in_body(yk):
+                        continue
+                    ws = sorted(lines_by_y[yk], key=lambda w: w["x0"])
                     if not bands:
                         bands.append((yk, ws))
                     else:
                         last_y, last_ws = bands[-1]
-                        if abs(yk - last_y) <= 6:  # tolérance verticale (ajustable)
+                        if abs(yk - last_y) <= 6:
                             last_ws.extend(ws)
                         else:
                             bands.append((yk, ws))
 
-                # Affecter chaque word à une colonne selon x et concaténer
+                # 5) affectation mots -> colonnes + filtrage bruit
                 for _, ws in bands:
+                    if FOOTER_NOISE_PAT.search(" ".join(w["text"] for w in ws)):
+                        continue
+
                     cells: Dict[str, List[str]] = {role: [] for (role, _, _) in col_bounds}
                     for w in ws:
                         xmid = (w["x0"] + w["x1"]) / 2
@@ -285,13 +285,16 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                     pu    = " ".join(cells.get("unit", [])).strip()
                     amt   = " ".join(cells.get("amount", [])).strip()
 
-                    # Nettoyages
+                    # validations
                     def _to_int(s: str) -> Optional[int]:
                         s2 = re.sub(r"[^\d]", "", s or "")
                         if not s2:
                             return None
                         try:
-                            return int(s2)
+                            val = int(s2)
+                            if val < 0 or val > 999:
+                                return None
+                            return val
                         except Exception:
                             return None
 
@@ -299,13 +302,29 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                     pu_f   = _norm_amount(pu)
                     amt_f  = _norm_amount(amt)
 
-                    # ligne valide si au moins label ou prix/amount
-                    if not (label or pu_f is not None or amt_f is not None or qty_i is not None):
+                    # heuristique anti-IBAN : si le "montant" est None, mais amt contient une longue séquence -> on ignore
+                    if (amt_f is None) and re.search(r'\d{4}\s\d{4}\s\d{4}\s\d{4}', amt):
+                        amt_f = None
+
+                    # si rien d’exploitable, skip
+                    if not (label or pu_f is not None or amt_f is not None or qty_i is not None or ref):
                         continue
 
-                    # Label fallback
                     if (not label) and ref:
                         label = ref
+
+                    # calcule amount si possible
+                    if amt_f is None and (pu_f is not None) and (qty_i is not None):
+                        amt_f = round(pu_f * qty_i, 2)
+
+                    # jette les lignes manifestement hors catalogue (ex: “Merci…”, “IBAN…”, “file://”)
+                    full_line = (ref or "") + " " + (label or "")
+                    if FOOTER_NOISE_PAT.search(full_line):
+                        continue
+
+                    # Si tout est None → skip
+                    if not (label or ref or qty_i is not None or pu_f is not None or amt_f is not None):
+                        continue
 
                     rows.append({
                         "ref":        ref,
@@ -315,7 +334,7 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         "amount":     amt_f
                     })
 
-        # Dédoublonnage simple
+        # dédoublonnage
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
@@ -327,9 +346,6 @@ def _parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# --------------------------------------------------------------------
-# pdfplumber – stratégie 2 : tables explicites (si présentes)
-# --------------------------------------------------------------------
 def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
     if pdfplumber is None:
         return []
@@ -362,24 +378,30 @@ def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
                         amt   = get(idx.get("amount"))
 
                         try:
-                            qty = int(re.sub(r"[^\d]", "", qty)) if qty else None
+                            qty_i = int(re.sub(r"[^\d]", "", qty)) if qty else None
+                            if qty_i is not None and (qty_i < 0 or qty_i > 999):
+                                qty_i = None
                         except Exception:
-                            qty = None
+                            qty_i = None
 
                         pu_f  = _norm_amount(pu)
                         amt_f = _norm_amount(amt)
+                        if amt_f is None and pu_f is not None and qty_i is not None:
+                            amt_f = round(pu_f * qty_i, 2)
 
-                        if not (label or pu_f is not None or amt_f is not None):
+                        if not (label or pu_f is not None or amt_f is not None or qty_i is not None):
+                            continue
+
+                        if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
                             continue
 
                         rows.append({
                             "ref":        (ref or "").strip() or None,
                             "label":      (label or "").strip(),
-                            "qty":        qty,
+                            "qty":        qty_i,
                             "unit_price": pu_f,
                             "amount":     amt_f
                         })
-        # dedup
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
@@ -391,9 +413,7 @@ def _parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-# --------------------------------------------------------------------
-# Extraction texte (PDF) / OCR (Images)
-# --------------------------------------------------------------------
+# ---------- Texte / OCR ----------
 def _pdf_text(path: Union[str, Path]) -> str:
     try:
         return _pdfminer_extract_text(str(path)) or ""
@@ -405,10 +425,7 @@ def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[s
         return "", {"error": "tesseract_not_found", "details": "Binaire tesseract absent."}
     try:
         img = Image.open(str(path))
-        # prétraitement simple : niveaux de gris + binarisation auto
         img = ImageOps.grayscale(img)
-        # Optionnel : légère augmentation de contraste
-        # img = ImageOps.autocontrast(img)
         txt = pytesseract.image_to_string(img, lang=lang) or ""
         return txt, {}
     except pytesseract.TesseractNotFoundError:
@@ -416,20 +433,11 @@ def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[s
     except Exception as e:
         return "", {"error": "ocr_failed", "details": f"{type(e).__name__}: {e}"}
 
-# --------------------------------------------------------------------
-# Public API
-# --------------------------------------------------------------------
+# ---------- Public ----------
 def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
-    """
-    Extraction unifiée :
-      - PDF texte → pdfminer + (lignes via xpos → table → regex).
-      - Images (PNG/JPG) → OCR via tesseract (fra+eng).
-    ocr: "auto" (par défaut), "force", "off" (pour PDF seulement).
-    """
     p = Path(path)
     ext = p.suffix.lower()
 
-    # Meta de base
     result: Dict[str, Any] = {
         "success": True,
         "meta": {
@@ -454,9 +462,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # ------------------------------------------------------
-    # 1) IMAGE → OCR
-    # ------------------------------------------------------
+    # --- images -> OCR ---
     if ext in {".png", ".jpg", ".jpeg"}:
         txt, err = _ocr_image_to_text(p, lang="fra+eng")
         if err:
@@ -467,37 +473,28 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         result["meta"]["ocr_pages"] = 1
         result["text"] = txt[:20000]
         result["text_preview"] = txt[:2000]
-
-        # Champs rapides depuis texte OCR
         _fill_fields_from_text(result, txt)
-        # Pas de lignes fiables via OCR sans layout → on laisse vide ici
         return result
 
-    # ------------------------------------------------------
-    # 2) PDF
-    # ------------------------------------------------------
-    # Texte brut
+    # --- PDF ---
     text = _pdf_text(p) or ""
     result["text"] = text[:20000]
     result["text_preview"] = text[:2000]
     result["meta"]["pages"] = (text.count("\f") + 1) if text else 0
 
-    # Champs depuis texte
     _fill_fields_from_text(result, text)
 
-    # Lignes d’articles — stratégie 1 : X/Y
+    # Lignes
     lines = _parse_lines_by_xpos(str(p))
     if lines:
         result["lines"] = lines
         result["meta"]["line_strategy"] = "xpos"
     else:
-        # Stratégie 2 : tables explicites
         lines = _parse_lines_extract_table(str(p))
         if lines:
             result["lines"] = lines
             result["meta"]["line_strategy"] = "table"
         else:
-            # Stratégie 3 : regex brut
             lines = _parse_lines_regex(text)
             if lines:
                 result["lines"] = lines
@@ -505,18 +502,18 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
     if lines:
         fields["lines_count"] = len(lines)
-        # Totaux : tenter d’inférer HT/TVA si possible
-        total_ttc = fields.get("total_ttc")
-        # somme des montants (si présents)
-        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
+
+        # Totaux plus sûrs
         vat_rate = _extract_vat_rate(text)
+        total_ttc = fields.get("total_ttc")
+        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
+
         if total_ttc and sum_lines and _approx(sum_lines, total_ttc, tol=1.5):
             th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
             fields["total_ht"]  = th
             fields["total_tva"] = tv
             fields["total_ttc"] = tt or total_ttc
         else:
-            # considère la somme comme HT si pas TTC matching
             total_ht = sum_lines if sum_lines else fields.get("total_ht")
             th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
             if th is not None: fields["total_ht"]  = th
@@ -525,9 +522,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
     return result
 
-# --------------------------------------------------------------------
-# Champs simples depuis le texte
-# --------------------------------------------------------------------
 def _extract_vat_rate(text: str) -> Optional[str]:
     m_vat = VAT_RATE_RE.search(text or "")
     if not m_vat:
@@ -538,9 +532,11 @@ def _extract_vat_rate(text: str) -> Optional[str]:
 def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
     fields = result["fields"]
 
+    # Numéro
     m_num = NUM_RE.search(text or "")
     fields["invoice_number"] = m_num.group(1).strip() if m_num else None
 
+    # Date
     m_date = DATE_RE.search(text or "")
     if m_date:
         try:
@@ -549,13 +545,16 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
         except Exception:
             fields["invoice_date"] = None
 
-    m_total = TOTAL_RE.search(text or "")
-    total_ttc = _norm_amount(m_total.group(1)) if m_total else None
+    # Total TTC (priorité : près de “Total…”, sinon strict €/décimales)
+    total_ttc = None
+    near = TOTAL_VAL_NEAR.search(text or "")
+    if near:
+        total_ttc = _norm_amount(near.group(1))
     if total_ttc is None:
-        amounts = [_norm_amount(a) for a in EUR_RE.findall(text)]
-        amounts = [a for a in amounts if a is not None]
-        if amounts:
-            total_ttc = max(amounts)
+        m_strict = EUR_STRICT_RE.findall(text or "")
+        if m_strict:
+            # on prend le dernier (souvent le TTC en bas)
+            total_ttc = _norm_amount(m_strict[-1])
     fields["total_ttc"] = total_ttc
 
     # currency
@@ -564,9 +563,7 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
     elif re.search(r"\bCHF\b", text, re.I): fields["currency"] = "CHF"
     elif re.search(r"\bUSD\b|\$", text, re.I): fields["currency"] = "USD"
 
-    # TVA rate (pour l’inférence)
-    # (stocké implicitement, on ne l’expose pas directement)
-    # seller / buyer blocks
+    # seller / buyer (blocs)
     m = SELLER_BLOCK.search(text or "")
     if m and not fields.get("seller"):
         fields["seller"] = _clean_block(m.group('blk'))
