@@ -13,10 +13,8 @@ from werkzeug.utils import secure_filename
 
 # --- Extractor ---
 try:
-    # nouvelle API
     from .extractors.pdf_basic import extract_document as _extract
 except Exception:
-    # alias rétro-compatibilité
     from .extractors.pdf_basic import extract_pdf as _extract  # type: ignore
 
 ALLOWED_EXTS = {".pdf", ".png", ".jpg", ".jpeg"}
@@ -24,11 +22,10 @@ ALLOWED_EXTS = {".pdf", ".png", ".jpg", ".jpeg"}
 app = Flask(__name__)
 CORS(app)
 
-
-# --- DIAG TESSERACT (temporaire) ---
+# --- DIAG TESSERACT ---
 @app.get("/diag")
 def diag():
-    import shutil, subprocess, os
+    import shutil, subprocess
     try:
         import pytesseract
         pt_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
@@ -52,11 +49,7 @@ def diag():
         "list_langs_error": err,
     })
 
-
 def _save_upload_to_tmp() -> Path:
-    """Sauvegarde l’upload multipart dans /tmp en conservant l’extension.
-    Lève une ValueError si pas de fichier ou ext non supportée.
-    """
     if "file" not in request.files:
         raise ValueError("no_file")
     f = request.files["file"]
@@ -68,53 +61,41 @@ def _save_upload_to_tmp() -> Path:
     if ext not in ALLOWED_EXTS:
         raise ValueError(f"unsupported_ext:{ext}")
 
-    # IMPORTANT: garder l’extension pour que l’extractor sache si c’est une image
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     f.save(tmp)
     tmp.flush()
     tmp.close()
     return Path(tmp.name)
 
-
 def _json_ok(data: Dict[str, Any], status: int = 200):
     resp = jsonify(data)
     resp.status_code = status
     return resp
 
-
 def _json_err(error: str, details: str = "", status: int = 400):
     return _json_ok({"success": False, "error": error, "details": details}, status=status)
-
 
 @app.get("/healthz")
 def healthz():
     return "ok", 200
 
-
 @app.post("/api/convert")
 def api_convert():
-    """JSON brut complet (contient .fields, .lines, .meta)."""
     try:
         path = _save_upload_to_tmp()
     except ValueError as e:
         return _json_err("bad_request", str(e), 400)
     try:
-        # OCR auto: images -> OCR ; PDF texte ; PDF scanné -> signale s’il manque tesseract
         data = _extract(str(path), ocr="auto")
-        # Même si success=False, on renvoie 200 avec un JSON propre (le front affichera le msg)
         return _json_ok(data, 200)
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-
+        try: os.unlink(path)
+        except Exception: pass
 
 @app.post("/api/summary")
 def api_summary():
-    """Résumé JSON à plat pour les colonnes principales."""
     try:
         path = _save_upload_to_tmp()
     except ValueError as e:
@@ -135,23 +116,21 @@ def api_summary():
             "total_ttc":      fields.get("total_ttc"),
             "currency":       fields.get("currency"),
             "lines_count":    fields.get("lines_count"),
+            # debug
+            "line_strategy":  (data.get("meta") or {}).get("line_strategy"),
+            "ocr_used":       (data.get("meta") or {}).get("ocr_used"),
         }
-        # si l’extractor signale une erreur OCR, on te la renvoie aussi
         if not data.get("success") and data.get("error"):
             flat.update({"_error": data.get("error"), "_details": data.get("details")})
         return _json_ok(flat, 200)
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-
+        try: os.unlink(path)
+        except Exception: pass
 
 @app.post("/api/summary.csv")
 def api_summary_csv():
-    """Résumé CSV (1 ligne)."""
     try:
         path = _save_upload_to_tmp()
     except ValueError as e:
@@ -172,26 +151,23 @@ def api_summary_csv():
             "total_ttc":      fields.get("total_ttc"),
             "currency":       fields.get("currency"),
             "lines_count":    fields.get("lines_count"),
+            "line_strategy":  (data.get("meta") or {}).get("line_strategy"),
+            "ocr_used":       (data.get("meta") or {}).get("ocr_used"),
         }
-        # CSV en mémoire
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=list(flat.keys()), delimiter=';', extrasaction="ignore")
         writer.writeheader()
         writer.writerow(flat)
-        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))  # BOM UTF-8
+        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))
         return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="billxpert_summary.csv")
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-
+        try: os.unlink(path)
+        except Exception: pass
 
 @app.post("/api/lines")
 def api_lines():
-    """Retourne {count, lines: [...]}. Accepte PDF/JPG/PNG."""
     try:
         path = _save_upload_to_tmp()
     except ValueError as e:
@@ -199,19 +175,19 @@ def api_lines():
     try:
         data = _extract(str(path), ocr="auto") or {}
         lines = data.get("lines") or []
-        return _json_ok({"count": len(lines), "lines": lines}, 200)
+        return _json_ok({
+            "count": len(lines),
+            "strategy": (data.get("meta") or {}).get("line_strategy"),
+            "lines": lines
+        }, 200)
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-
+        try: os.unlink(path)
+        except Exception: pass
 
 @app.post("/api/lines.csv")
 def api_lines_csv():
-    """CSV des lignes d’articles."""
     try:
         path = _save_upload_to_tmp()
     except ValueError as e:
@@ -231,16 +207,13 @@ def api_lines_csv():
                 "unit_price": r.get("unit_price"),
                 "amount":     r.get("amount"),
             })
-        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))  # BOM UTF-8
+        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))
         return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="billxpert_lines.csv")
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
-
+        try: os.unlink(path)
+        except Exception: pass
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
