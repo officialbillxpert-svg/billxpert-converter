@@ -534,17 +534,22 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-       # --- images -> OCR ---
+         # --- images -> OCR ---
     if ext in {".png", ".jpg", ".jpeg"}:
-        txt, err = _ocr_image_to_text(p, lang="fra+eng")
-        if err:
+        txt, info = _ocr_image_to_text(p, lang="fra+eng")
+    
+        # si la fonction remonte une vraie erreur
+        if info.get("error"):
             result["success"] = False
-            result.update(err)
+            result.update(info)
             return result
+    
+        # succès : on enrichit les métadonnées
         result["meta"]["ocr_used"] = True
         result["meta"]["ocr_pages"] = 1
-        if "ocr_lang" in err:  # <-- ajouté
-            result["meta"]["ocr_lang"] = err["ocr_lang"]  # <-- ajouté
+        if "ocr_lang" in info:
+            result["meta"]["ocr_lang"] = info["ocr_lang"]
+    
         result["text"] = txt[:20000]
         result["text_preview"] = txt[:2000]
         _fill_fields_from_text(result, txt)
