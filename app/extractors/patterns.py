@@ -1,4 +1,4 @@
-# app/extractors/patterns.py
+@'
 from __future__ import annotations
 import re
 
@@ -28,11 +28,12 @@ TOTAL_HT_NEAR_RE = re.compile(
     re.I
 )
 
+# TVA (montant) — forcer € pour éviter de prendre "20" de "TVA 20%"
 TVA_AMOUNT_NEAR_RE = re.compile(
     r'\bTVA\b[^\n\r]{0,80}?(?:\d{1,2}[.,]?\d?\s*%\s*[^\n\r]{0,20})?([0-9][0-9\.\,\s]+)\s*€',
     re.I
 )
-# Back-compat alias
+# Alias rétro-compat
 TVA_NEAR_RE = TVA_AMOUNT_NEAR_RE
 
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
@@ -90,3 +91,4 @@ __all__ = [
     "SELLER_BLOCK", "CLIENT_BLOCK", "EMETTEUR_BLOCK", "DESTINATAIRE_BLOCK",
     "TABLE_HEADER_HINTS", "FOOTER_NOISE_PAT", "LINE_RX",
 ]
+'@ | Set-Content app\extractors\patterns.py
