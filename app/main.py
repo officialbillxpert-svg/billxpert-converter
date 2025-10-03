@@ -12,11 +12,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 # --- Extractor ---
-# Supporte: `python -m app.main` (import relatif) ET `python app/main.py` (import absolu)
-try:
-    from .extractors.pdf_basic import extract_document as _extract
-except Exception:
-    from extractors.pdf_basic import extract_document as _extract  # type: ignore
+from app.extractors.pdf_basic import extract_document as _extract
 
 ALLOWED_EXTS = {".pdf", ".png", ".jpg", ".jpeg"}
 
