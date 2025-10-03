@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 
 # ---------- Version ----------
-PATTERNS_VERSION = "v2025-10-03d"
+PATTERNS_VERSION = "v2025-10-03f"
 
 # ---------- Numéro / Date ----------
 FACTURE_NO_RE = re.compile(
@@ -18,21 +18,20 @@ DATE_RE = re.compile(
 
 # ---------- Totaux ----------
 TOTAL_TTC_NEAR_RE = re.compile(
-    r'(?:Total\s*(?:TTC)?|Grand\s*total|Total\s*amount|Total\s*à\s*payer)\s*[:\-]?\s*[^\n\r]{0,40}?'
+    r'(?:Total\s*(?:TTC)?|Grand\s*total|Total\s*amount|Total\s*à\s*payer)\s*[:\-]?\s*[^\n\r]{0,60}?'
     r'([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
 TOTAL_HT_NEAR_RE = re.compile(
-    r'Total\s*HT\s*[:\-]?\s*[^\n\r]{0,40}?([0-9][0-9\.\,\s]+)\s*€?',
+    r'Total\s*HT\s*[:\-]?\s*[^\n\r]{0,60}?([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
 
 # TVA (montant) — forcer € pour éviter de prendre "20" de "TVA 20%"
 TVA_AMOUNT_NEAR_RE = re.compile(
-    r'\bTVA\b[^\n\r]{0,80}?(?:\d{1,2}[.,]?\d?\s*%\s*[^\n\r]{0,20})?([0-9][0-9\.\,\s]+)\s*€',
+    r'\bTVA\b[^\n\r]{0,120}?(?:\d{1,2}[.,]?\d?\s*%\s*[^\n\r]{0,30})?([0-9][0-9\.\,\s]+)\s*€',
     re.I
 )
-# Alias rétro-compat
 TVA_NEAR_RE = TVA_AMOUNT_NEAR_RE
 
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
