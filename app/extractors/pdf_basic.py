@@ -22,7 +22,7 @@ except Exception:
     ImageOps = None     # type: ignore
 
 # ---------- Version interne ----------
-PATTERNS_VERSION = "v2025-10-02b"
+PATTERNS_VERSION = "v2025-10-02c"
 
 # ---------- Regex ----------
 NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
@@ -34,7 +34,13 @@ TOTAL_TTC_NEAR_RE = re.compile(
     re.I
 )
 TOTAL_HT_NEAR_RE = re.compile(r'Total\s*HT[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
-TVA_NEAR_RE = re.compile(r'\bTVA\b[\s\S]{0,120}?([0-9][0-9\.\,\s]+)\s*€?', re.I)
+
+# --- NOUVEAU : sépare taux et montant TVA pour éviter de capturer "20" (taux) à la place de 1040,00 (montant)
+TVA_RATE_ONLY_RE   = re.compile(r'\bTVA\b[^\n\r]{0,80}?(\d{1,2}(?:[.,]\d{1,2})?)\s*%', re.I)
+TVA_AMOUNT_NEAR_RE = re.compile(
+    r'\bTVA\b[^\n\r]{0,120}?([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?',
+    re.I
+)
 
 # fallback stricte avec décimales (évite IBAN)
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
@@ -44,12 +50,13 @@ SIREN_RE = re.compile(r'(?<!\d)\d{9}(?!\d)')
 TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
 IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
 
+# --- Ajout "Destinataire"
 SELLER_BLOCK = re.compile(
-    r'(?:Émetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer)',
+    r'(?:Émetteur|Emetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer|Destinataire)',
     re.I | re.S
 )
 CLIENT_BLOCK = re.compile(
-    r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Vendeur|Seller)',
+    r'(?:Client|Acheteur|Buyer|Destinataire)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Emetteur|Vendeur|Seller)',
     re.I | re.S
 )
 
@@ -75,14 +82,16 @@ FOOTER_NOISE_PAT = re.compile(r'(merci|paiement|iban|file://|conditions|due date
 
 # ---------- Helpers ----------
 def _norm_amount(s: str) -> Optional[float]:
-    """Normalise un montant. Ignore IBAN/numéros/absurdités."""
+    """Normalise un montant. Ignore IBAN/numéros/absurdités. Gère '1 234,00 €' et supprime symboles."""
     if not s:
         return None
     s = s.strip()
+    # supprime symboles monnaie et non numériques usuels
+    s = re.sub(r'[€$£CHFUSD]', '', s, flags=re.I).strip()
 
-    # Longue séquence de chiffres sans séparateur décimal et sans €
+    # Longue séquence de chiffres sans séparateur décimal et sans signe monétaire -> probablement bruit (ex: SIRET, IBAN)
     digits_only = re.sub(r'\D', '', s)
-    if (len(digits_only) >= 11) and ('€' not in s) and (',' not in s) and ('.' not in s):
+    if (len(digits_only) >= 11) and (',' not in s) and ('.' not in s):
         return None
 
     # IBAN-like
@@ -90,6 +99,7 @@ def _norm_amount(s: str) -> Optional[float]:
         return None
 
     s = s.replace(' ', '')
+
     # "1.234,56" -> "1234.56"
     if ',' in s and '.' in s:
         s = s.replace('.', '').replace(',', '.')
@@ -100,6 +110,8 @@ def _norm_amount(s: str) -> Optional[float]:
         val = float(s)
         if val < 0 or val > 2_000_000:
             return None
+        # Heuristique anti-"624000" (valeur sans décimales issue d’un OCR) :
+        # si plus de 4 chiffres avant décimales et pas de séparateur d’origine, on laissera la réconciliation corriger.
         return round(val, 2)
     except Exception:
         return None
@@ -482,6 +494,68 @@ def _ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[s
 
     return "", {"error": "ocr_failed", "details": last_err or "OCR vide.", "tried_langs": tried}
 
+# ---------- Réconciliations & Post-traitements ----------
+def _extract_vat_rate(text: str) -> Optional[str]:
+    # essaie d’abord le pattern général “TVA/VAT 20%”
+    m_vat = VAT_RATE_RE.search(text or "")
+    if m_vat:
+        vr = m_vat.group(1)
+        return '5.5' if vr in ('5,5', '5.5') else vr
+    # sinon un autre “TVA xx%” plus permissif
+    m2 = TVA_RATE_ONLY_RE.search(text or "")
+    if m2:
+        vr = m2.group(1)
+        return '5.5' if vr in ('5,5', '5.5') else vr
+    return None
+
+def _fix_roles(fields: Dict[str, Any], text: str) -> None:
+    """Corrige seller/buyer si inversés."""
+    seller = (fields.get("seller") or "").lower()
+    buyer  = (fields.get("buyer")  or "").lower()
+    if ("destinataire" in seller and "emet" in buyer) or ("destinataire" in seller and "seller" not in seller):
+        fields["seller"], fields["buyer"] = fields.get("buyer"), fields.get("seller")
+
+def _reconcile_totals(fields: Dict[str, Any], text: str) -> None:
+    """Corrige TTC/TVA/HT incohérents (ex: TTC=624000 au lieu de 6240,00)."""
+    vat_rate = _extract_vat_rate(text)
+
+    # Montant TVA (privilégie la détection "près de TVA" avec décimales)
+    if fields.get("total_tva") is None:
+        m_amt = TVA_AMOUNT_NEAR_RE.search(text or "")
+        if m_amt:
+            tv = _norm_amount(m_amt.group(1))
+            if tv is not None:
+                fields["total_tva"] = tv
+
+    ht, tva, ttc = fields.get("total_ht"), fields.get("total_tva"), fields.get("total_ttc")
+
+    # 1) Si HT et TVA connus -> TTC = HT + TVA
+    if ht is not None and tva is not None:
+        ttc_calc = round(ht + tva, 2)
+        if (ttc is None) or (not _approx(ttc, ttc_calc, tol=1.0)) or (ttc > 10 * max(1.0, ttc_calc)):
+            fields["total_ttc"] = ttc_calc
+            ttc = ttc_calc
+
+    # 2) Si HT + taux connus -> calcule TVA/TTC
+    if ht is not None and vat_rate is not None:
+        rate = float(str(vat_rate).replace(',', '.')) / 100.0
+        tva_calc = round(ht * rate, 2)
+        ttc_calc = round(ht + tva_calc, 2)
+        # Si TVA absente ou aberrante, remplace
+        if (tva is None) or (not _approx(tva, tva_calc, tol=1.0)):
+            fields["total_tva"] = tva_calc; tva = tva_calc
+        # Si TTC absent/aberrant, remplace
+        if (ttc is None) or (not _approx(ttc, ttc_calc, tol=1.0)) or (ttc > 10 * max(1.0, ttc_calc)):
+            fields["total_ttc"] = ttc_calc; ttc = ttc_calc
+
+    # 3) Si TTC beaucoup trop grand par rapport à HT (classique OCR sans virgule)
+    if ht is not None and ttc is not None and ttc > 10 * max(1.0, ht):
+        if tva is not None:
+            fields["total_ttc"] = round(ht + tva, 2)
+        elif vat_rate is not None:
+            rate = float(str(vat_rate).replace(',', '.')) / 100.0
+            fields["total_ttc"] = round(ht * (1.0 + rate), 2)
+
 # ---------- Public ----------
 def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     p = Path(path)
@@ -538,7 +612,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             result["meta"]["line_strategy"] = "regex"
             fields["lines_count"] = len(lines)
 
-            # Recalcule/cohérence des totaux
+            # Recalcule/cohérence des totaux via lignes
             vat_rate  = _extract_vat_rate(txt)
             total_ttc = fields.get("total_ttc")
             sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
@@ -555,13 +629,9 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
                 if tv is not None: fields["total_tva"] = tv
                 if tt is not None: fields["total_ttc"] = tt
 
-        # Post-pass cohérence TVA (branche image)
-        if (fields.get("total_tva") is None 
-            and fields.get("total_ttc") is not None 
-            and fields.get("total_ht")  is not None):
-            diff = round(fields["total_ttc"] - fields["total_ht"], 2)
-            if 0 <= diff <= 2_000_000:
-                fields["total_tva"] = diff
+        # Post-pass : corrige TVA/TTC/HT incohérents + rôles
+        _reconcile_totals(fields, txt)
+        _fix_roles(fields, txt)
 
         return result  # fin de la branche images
 
@@ -608,25 +678,12 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tv is not None: fields["total_tva"] = tv
             if tt is not None: fields["total_ttc"] = tt
 
-    # Post-pass cohérence TVA (branche PDF)
-    if (fields.get("total_tva") is None 
-        and fields.get("total_ttc") is not None 
-        and fields.get("total_ht")  is not None):
-        diff = round(fields["total_ttc"] - fields["total_ht"], 2)
-        if 0 <= diff <= 2_000_000:
-            fields["total_tva"] = diff
+    # Post-pass : corrige TVA/TTC/HT incohérents + rôles
+    _reconcile_totals(fields, text)
+    _fix_roles(fields, text)
 
-    return result  # fin de la branche PDF
+    return result
 
-# ---------- Extract VAT rate ----------
-def _extract_vat_rate(text: str) -> Optional[str]:
-    m_vat = VAT_RATE_RE.search(text or "")
-    if not m_vat:
-        return None
-    vr = m_vat.group(1)
-    return '5.5' if vr in ('5,5', '5.5') else vr
-
-# ---------- Remplissage des champs ----------
 def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
     fields = result["fields"]
 
@@ -650,6 +707,14 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
     near = TOTAL_TTC_NEAR_RE.findall(text or "")
     if near:
         total_ttc = _norm_amount(near[-1])
+        # si la capture NEAR est probablement “grosse” (sans décimales) et qu’on a un strict ailleurs, on préfère strict
+        if total_ttc is not None and total_ttc >= 100000:
+            m_strict_any = EUR_STRICT_RE.findall(text or "")
+            if m_strict_any:
+                # prend la dernière valeur plausible du document si TTC NEAR semble aberrant
+                cand = _norm_amount(m_strict_any[-1])
+                if cand is not None and cand < total_ttc:
+                    total_ttc = cand
     if total_ttc is None:
         m_strict = EUR_STRICT_RE.findall(text or "")
         if m_strict:
@@ -663,8 +728,8 @@ def _fill_fields_from_text(result: Dict[str, Any], text: str) -> None:
         if ht_val is not None:
             fields["total_ht"] = ht_val
 
-    # TVA (montant)
-    m_tva = TVA_NEAR_RE.search(text or "")
+    # TVA (montant) — privilégie la regex dédiée au montant
+    m_tva = TVA_AMOUNT_NEAR_RE.search(text or "")
     if m_tva:
         tva_val = _norm_amount(m_tva.group(1))
         if tva_val is not None:
