@@ -25,7 +25,7 @@ TOTAL_TTC_NEAR_RE = re.compile(
     re.I
 )
 TOTAL_HT_NEAR_RE = re.compile(r'Total\s*HT[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?', re.I)
-TVA_NEAR_RE      = re.compile(r'\bTVA\b[\s\S]{0,120}?([0-9][0-9\.\,\s]+)\s*€?', re.I)
+TVA_NEAR_RE = re.compile(r'\bTVA\b[\s\S]{0,120}?([0-9][0-9\.\,\s]+)\s*€', re.I)
 
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
 
