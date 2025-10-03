@@ -1,155 +1,152 @@
 from __future__ import annotations
-import warnings
+import io
+import os
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple, Optional
 
-from pdfminer.high_level import extract_text as _pdfminer_extract_text
+import pytesseract
+from PIL import Image, ImageOps, ImageFilter
 
-# Optional CV stack for better OCR
-try:
-    import cv2  # type: ignore
-except Exception:
-    cv2 = None  # type: ignore
+# Timeout par défaut (secondes) – adapté aux images A4 300 dpi
+DEFAULT_TIMEOUT = int(os.getenv("OCR_TIMEOUT", "20"))
 
-try:
-    import pytesseract
-    from PIL import Image, ImageOps, UnidentifiedImageError
-except Exception:
-    pytesseract = None  # type: ignore
-    Image = None        # type: ignore
-    ImageOps = None     # type: ignore
-    UnidentifiedImageError = Exception  # type: ignore
+def _load_image(path: Path) -> Image.Image:
+    with open(path, "rb") as f:
+        img = Image.open(io.BytesIO(f.read()))
+        img.load()
+    return img
 
-# Optional handwriting OCR (install paddleocr or rapidocr-onnxruntime to enable)
-try:
-    from paddleocr import PaddleOCR  # type: ignore
-except Exception:
-    PaddleOCR = None  # type: ignore
+def _preprocess(img: Image.Image) -> Image.Image:
+    """
+    Prétraitement robuste mais léger (sans OpenCV):
+    - Convertit en niveaux de gris
+    - Auto-contraste
+    - Lissage léger pour bruit / compression
+    - Binarisation douce
+    - Redimensionnement max dim 2400 px
+    """
+    # 1) Grayscale
+    g = img.convert("L")
 
+    # 2) Auto-contraste (clip 2% pour éviter de cramer)
+    g = ImageOps.autocontrast(g, cutoff=2)
 
-def pdf_text(path: Union[str, Path]) -> str:
+    # 3) Lissage léger (évite faux contours JPEG)
+    g = g.filter(ImageFilter.MedianFilter(size=3))
+
+    # 4) Binarisation douce (point de seuil adaptatif simple)
+    #    On garde du niveau de gris si besoin pour OCR, donc on ne durcit pas trop
+    #    => on applique un “stretch” doux
+    g = ImageOps.equalize(g, mask=None)
+
+    # 5) Redimensionnement (si trop petit ou trop grand)
+    max_dim = 2400
+    w, h = g.size
+    scale = min(max_dim / max(w, h), 1.5)  # on upsample max x1.5
+    if scale != 1.0:
+        g = g.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    return g
+
+def _tesseract_try(img: Image.Image, lang: str, config: str, timeout: int) -> Tuple[str, Dict]:
+    """
+    Lance Tesseract une fois avec un profil donné.
+    Renvoie (texte, info).
+    """
+    text = pytesseract.image_to_string(img, lang=lang, config=config, timeout=timeout)
+    info = {
+        "ocr_lang": lang,
+        "tesseract_config": config,
+        "timeout_s": timeout,
+    }
+    return text, info
+
+def ocr_image_to_text(path_or_image: Path | Image.Image, lang: str = "fra+eng", timeout: Optional[int] = None) -> Tuple[str, Dict]:
+    """
+    OCR d’une image avec plusieurs stratégies de secours.
+    Renvoie (texte, info). En cas d’échec, lève RuntimeError avec un dict “info” exploitable.
+    """
+    timeout = timeout or DEFAULT_TIMEOUT
+    info: Dict = {}
+
     try:
-        return _pdfminer_extract_text(str(path)) or ""
+        img = path_or_image if isinstance(path_or_image, Image.Image) else _load_image(Path(path_or_image))
+    except Exception as e:
+        info.update({"error": f"load_image_failed:{type(e).__name__}", "details": str(e)})
+        raise RuntimeError("Image load failed")  # laisser pdf_basic capturer proprement
+
+    # Prétraitement
+    try:
+        pim = _preprocess(img)
+    except Exception as e:
+        # On tente quand même l’original si le prétraitement a échoué
+        pim = img
+        info.setdefault("warnings", []).append(f"preprocess_failed:{type(e).__name__}:{e}")
+
+    # Profils de fallback : du plus “général” au plus “tolérant”
+    profiles = [
+        "--oem 3 --psm 6",   # LSTM + mode semi-automatique (lignes de texte)
+        "--oem 1 --psm 3",   # LSTM + bloc de texte
+        "--oem 3 --psm 4",   # LSTM + colonnes / texte variable
+        "--oem 3 --psm 11",  # Sparse text (épars)
+        "--oem 0 --psm 6",   # Legacy engine (parfois mieux sur police très “sales”)
+    ]
+
+    last_err: Optional[str] = None
+    for i, cfg in enumerate(profiles, start=1):
+        try:
+            txt, runinfo = _tesseract_try(pim, lang=lang, config=cfg, timeout=timeout)
+            info.update(runinfo)
+            # Nettoyage simple (couper les null bytes, normaliser fin de ligne)
+            txt = txt.replace("\x00", "").strip()
+            if txt:
+                return txt, info
+            # Texte vide : on tente le profil suivant
+            info.setdefault("warnings", []).append(f"empty_text_profile_{i}")
+        except RuntimeError as e:
+            # Timeout ou autre erreur tesseract levée par pytesseract
+            last_err = f"RuntimeError:{e}"
+            info.setdefault("warnings", []).append(f"profile_{i}_runtimeerror:{e}")
+            # Si timeout, on accorde UNE relance avec +5s
+            if "timeout" in str(e).lower():
+                extra_timeout = min(timeout + 5, timeout + 10)
+                try:
+                    txt, runinfo = _tesseract_try(pim, lang=lang, config=cfg, timeout=extra_timeout)
+                    info.update(runinfo)
+                    txt = txt.replace("\x00", "").strip()
+                    if txt:
+                        return txt, info
+                    info.setdefault("warnings", []).append(f"empty_text_profile_{i}_retry")
+                except RuntimeError as e2:
+                    last_err = f"RuntimeError(retry):{e2}"
+                    info.setdefault("warnings", []).append(f"profile_{i}_retry_runtimeerror:{e2}")
+            # On enchaîne sur le profil suivant
+        except Exception as e:
+            last_err = f"{type(e).__name__}:{e}"
+            info.setdefault("warnings", []).append(f"profile_{i}_exception:{type(e).__name__}:{e}")
+
+    # Si on est là : tous les profils ont échoué / donné vide
+    err = "handwriting_engine_unavailable" if ("timeout" in (last_err or "").lower()) else "ocr_failed"
+    info.update({
+        "error": err,
+        "details": last_err or "all_profiles_failed",
+        "ocr_lang": lang,
+        "ocr_used": False,
+    })
+    raise RuntimeError(err)
+
+def pdf_text(path: Path) -> str:
+    """
+    Extraction texte natif PDF (pdfminer.six).
+    Si le PDF est une image scannée, cette fonction renverra souvent peu ou pas de texte.
+    L’OCR des PDFs scannés se fait ailleurs (convert-to-image puis ocr_image_to_text par page).
+    """
+    try:
+        from pdfminer.high_level import extract_text
     except Exception:
         return ""
 
-
-def _opencv_preprocess(p: Path) -> "Image.Image":
-    """Deskew + denoise + adaptive threshold (if OpenCV available)."""
-    if cv2 is None or Image is None:
-        # Fallback simple PIL binarization
-        img = Image.open(str(p))
-        g = ImageOps.grayscale(img)
-        return g.point(lambda x: 255 if x > 180 else 0, mode="1")
-
-    img = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_COLOR) if False else cv2.imread(str(p))
-    if img is None:
-        raise UnidentifiedImageError("Cannot open image")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Denoise & normalize
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    # Deskew (estimate angle by Hough on edges)
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLines(edges, 1, 3.14159/180, 120)
-    angle = 0.0
-    if lines is not None:
-        import numpy as np
-        # average angle around horizontal/vertical
-        for rho_theta in lines[:20]:
-            rho, theta = rho_theta[0]
-            a = (theta - 3.14159/2) * 180 / 3.14159
-            angle += a
-        angle = angle / min(len(lines), 20)
-    if abs(angle) > 0.5:
-        (h, w) = gray.shape[:2]
-        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-        gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 35, 15)
-    pil = Image.fromarray(thr)
-    return pil
-
-
-def _tesseract_ocr(img: "Image.Image", lang: str = "fra+eng") -> Tuple[str, Dict[str, str]]:
-    if pytesseract is None:
-        return "", {"error": "tesseract_not_found"}
     try:
-        import shutil
-        tpath = shutil.which("tesseract")
-        if tpath:
-            pytesseract.pytesseract.tesseract_cmd = tpath
+        return extract_text(str(path)) or ""
     except Exception:
-        pass
-
-    try:
-        # timeout hard stop to avoid wedges on bad scans
-        txt = pytesseract.image_to_string(img, lang=lang, timeout=20)  # type: ignore[arg-type]
-        return txt or "", {"ocr_engine": "tesseract", "ocr_lang": lang}
-    except pytesseract.TesseractError as e:  # type: ignore[attr-defined]
-        return "", {"error": "tesseract_error", "details": str(e)}
-    except Exception as e:
-        return "", {"error": "tesseract_exception", "details": f"{type(e).__name__}: {e}"}
-
-
-def _handwriting_ocr(p: Path) -> Tuple[str, Dict[str, str]]:
-    """Optional handwriting engine via PaddleOCR if available."""
-    if PaddleOCR is None:
-        return "", {"error": "handwriting_engine_unavailable"}
-    try:
-        # latin best model
-        ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        res = ocr.ocr(str(p), cls=True)
-        lines = []
-        for page in res or []:
-            for line in page or []:
-                if not line or len(line) < 2:
-                    continue
-                text = (line[1] or ["", 0])[0]
-                lines.append(text)
-        return "\n".join(lines), {"ocr_engine": "paddleocr"}
-    except Exception as e:
-        return "", {"error": "handwriting_exception", "details": str(e)}
-
-
-def ocr_image_to_text(path: Union[str, Path], lang: str = "fra+eng") -> Tuple[str, Dict[str, object]]:
-    """
-    Robust OCR: OpenCV preprocessing -> Tesseract. If result too weak and handwriting
-    engine is present, try it as fallback. Always return info dict (no exceptions).
-    """
-    p = Path(path)
-    meta: Dict[str, object] = {"ocr_used": True}
-
-    if Image is None:
-        return "", {"error": "pillow_missing"}
-
-    # Preprocess
-    try:
-        if cv2 is not None:
-            img = _opencv_preprocess(p)
-        else:
-            img = Image.open(str(p))
-            g = ImageOps.grayscale(img)
-            img = g.point(lambda x: 255 if x > 180 else 0, mode="1")
-    except UnidentifiedImageError as e:
-        return "", {"error": "bad_image", "details": str(e)}
-    except Exception as e:
-        return "", {"error": "preprocess_error", "details": f"{type(e).__name__}: {e}"}
-
-    # First pass: Tesseract
-    txt, info = _tesseract_ocr(img, lang=lang)
-    meta.update(info)
-    if txt and len(txt.strip()) >= 10:
-        return txt, meta
-
-    # Fallback: handwriting OCR if available
-    htxt, hinter = _handwriting_ocr(Path(path))
-    if htxt and len(htxt.strip()) >= 10:
-        meta.update(hinter)
-        return htxt, meta
-
-    # Give best we got
-    if not txt and not htxt:
-        meta.update(hinter if 'error' in hinter else {})
-    return (txt or htxt or ""), meta
+        return ""
