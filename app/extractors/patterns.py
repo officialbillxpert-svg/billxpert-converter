@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 
 # ---------- Version ----------
-PATTERNS_VERSION = "v2025-10-03e"
+PATTERNS_VERSION = "v2025-10-03d"
 
 # ---------- Numéro / Date ----------
 FACTURE_NO_RE = re.compile(
@@ -27,11 +27,12 @@ TOTAL_HT_NEAR_RE = re.compile(
     re.I
 )
 
-# TVA (montant) — forcer € pour éviter de lire "20" de "TVA 20%"
+# TVA (montant) — forcer € pour éviter de prendre "20" de "TVA 20%"
 TVA_AMOUNT_NEAR_RE = re.compile(
     r'\bTVA\b[^\n\r]{0,80}?(?:\d{1,2}[.,]?\d?\s*%\s*[^\n\r]{0,20})?([0-9][0-9\.\,\s]+)\s*€',
     re.I
 )
+# Alias rétro-compat
 TVA_NEAR_RE = TVA_AMOUNT_NEAR_RE
 
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
@@ -63,13 +64,7 @@ DESTINATAIRE_BLOCK = re.compile(
     re.I | re.S
 )
 
-# ---------- Lignes (regex fallback) ----------
-LINE_RX = re.compile(
-    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
-    r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
-    re.M
-)
-
+# ---------- Lignes ----------
 TABLE_HEADER_HINTS = [
     ("ref", "réf", "reference", "code"),
     ("désignation", "designation", "libellé", "description", "label"),
@@ -79,6 +74,12 @@ TABLE_HEADER_HINTS = [
 ]
 
 FOOTER_NOISE_PAT = re.compile(r'(merci|paiement|iban|file://|conditions|due date|bank|html)', re.I)
+
+LINE_RX = re.compile(
+    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
+    r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
+    re.M
+)
 
 __all__ = [
     "PATTERNS_VERSION",
