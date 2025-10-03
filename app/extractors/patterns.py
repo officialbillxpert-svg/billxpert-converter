@@ -12,7 +12,13 @@ INVOICE_NUM_RE = re.compile(
     r'(?:Num[ée]ro|FACTURE\s*N[°ºo])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})',
     re.I
 )
-DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
+DATE_RE = re.compile(
+    r'('
+    r'\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{2,4}'
+    r'|'
+    r'\d{4}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{1,2}'
+    r')'
+)
 
 TOTAL_TTC_NEAR_RE = re.compile(
     r'(?:Total\s*(?:TTC)?|Grand\s*total|Total\s*amount|Total\s*à\s*payer)[^\n\r]*?([0-9][0-9\.\,\s]+)\s*€?',
