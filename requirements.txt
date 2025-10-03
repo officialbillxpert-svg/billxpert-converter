@@ -8,3 +8,7 @@ pypdfium2==4.30.0
 Pillow==11.3.0
 pytesseract==0.3.10
 python-dateutil==2.9.0.post0
+opencv-python-headless==4.10.0.84
+# Optional handwriting (heavy):
+# paddleocr==2.7.0.3
+# shapely==2.0.4
