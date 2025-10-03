@@ -1,0 +1,1 @@
+web: gunicorn app.main:app --bind 0.0.0.0:$PORT --workers ${WEB_CONCURRENCY:-1} --threads ${WEB_THREADS:-2} --timeout ${WEB_TIMEOUT:-120} --max-requests 200 --max-requests-jitter 50 --worker-tmp-dir /dev/shm --log-level info
