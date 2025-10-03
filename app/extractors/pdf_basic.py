@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from .patterns import PATTERNS_VERSION, VAT_RATE_RE
 from .io_pdf_image import pdf_text, ocr_image_to_text
@@ -8,6 +8,7 @@ from .fields import _fill_fields_from_text
 from .totals import _infer_totals
 from .lines_parsers import parse_lines_by_xpos, parse_lines_extract_table, parse_lines_regex
 from .utils_amounts import approx as approx_utils
+
 
 def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     p = Path(path)
@@ -38,29 +39,32 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # IMAGES -> OCR
+    # ---------- IMAGES -> OCR ----------
     if ext in {".png", ".jpg", ".jpeg"}:
         txt, info = ocr_image_to_text(p, lang="fra+eng")
         if info.get("error"):
             result["success"] = False
             result.update(info)
             return result
+
         result["meta"]["ocr_used"] = True
         result["meta"]["ocr_pages"] = 1
         if "ocr_lang" in info:
             result["meta"]["ocr_lang"] = info["ocr_lang"]
-        result["text"] = txt[:20000]
-        result["text_preview"] = txt[:2000]
-        _fill_fields_from_text(result, txt)
+
+        result["text"] = (txt or "")[:20000]
+        result["text_preview"] = (txt or "")[:2000]
+
+        _fill_fields_from_text(result, txt or "")
 
         # Lignes (OCR -> regex)
-        lines = parse_lines_regex(txt)
+        lines: List[Dict[str, Any]] = parse_lines_regex(txt or "")
         if lines:
             result["lines"] = lines
             result["meta"]["line_strategy"] = "regex"
             fields["lines_count"] = len(lines)
 
-            vat_rate  = _extract_vat_rate(txt)
+            vat_rate  = _extract_vat_rate(txt or "")
             total_ttc = fields.get("total_ttc")
             sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
 
@@ -76,16 +80,17 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
                 if tv is not None: fields["total_tva"] = tv
                 if tt is not None: fields["total_ttc"] = tt
 
-        # Post-pass VAT
-        if (fields.get("total_tva") is None 
-            and fields.get("total_ttc") is not None 
+        # Post-pass TVA: TTC - HT si manquante
+        if (fields.get("total_tva") is None
+            and fields.get("total_ttc") is not None
             and fields.get("total_ht")  is not None):
             diff = round(fields["total_ttc"] - fields["total_ht"], 2)
             if 0 <= diff <= 2_000_000:
                 fields["total_tva"] = diff
+
         return result
 
-    # PDF
+    # ---------- PDF ----------
     text = pdf_text(p) or ""
     result["text"] = text[:20000]
     result["text_preview"] = text[:2000]
@@ -111,6 +116,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
     if lines:
         fields["lines_count"] = len(lines)
+
         vat_rate  = _extract_vat_rate(text)
         total_ttc = fields.get("total_ttc")
         sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
@@ -127,15 +133,16 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tv is not None: fields["total_tva"] = tv
             if tt is not None: fields["total_ttc"] = tt
 
-    # Post-pass VAT
-    if (fields.get("total_tva") is None 
-        and fields.get("total_ttc") is not None 
+    # Post-pass TVA: TTC - HT si manquante
+    if (fields.get("total_tva") is None
+        and fields.get("total_ttc") is not None
         and fields.get("total_ht")  is not None):
         diff = round(fields["total_ttc"] - fields["total_ht"], 2)
         if 0 <= diff <= 2_000_000:
             fields["total_tva"] = diff
 
     return result
+
 
 def _extract_vat_rate(text: str) -> str | None:
     m_vat = VAT_RATE_RE.search(text or "")
