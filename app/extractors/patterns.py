@@ -39,6 +39,9 @@ TVA_AMOUNT_NEAR_RE = re.compile(
     re.I
 )
 
+# --- Taux de TVA (pour compat historique avec pdf_basic.py) ---
+VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
+
 # Fallback stricte avec décimales (évite IBAN/longs blocs de chiffres)
 EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
 
