@@ -1,10 +1,18 @@
 from __future__ import annotations
 from typing import Optional, Tuple
 
-def infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def approx(a: float | None, b: float | None, tol: float = 1.2) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol
+
+def _infer_totals(total_ttc, total_ht, total_tva, vat_rate) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if vat_rate is None:
         return total_ht, total_tva, total_ttc
-    rate = float(str(vat_rate).replace(',', '.')) / 100.0
+    try:
+        rate = float(str(vat_rate).replace(',', '.')) / 100.0
+    except Exception:
+        return total_ht, total_tva, total_ttc
     ht, tva, ttc = total_ht, total_tva, total_ttc
     if ttc is not None and (ht is None or tva is None):
         try:
