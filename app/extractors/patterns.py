@@ -3,8 +3,15 @@ import re
 
 PATTERNS_VERSION = "v2025-10-02b"
 
-NUM_RE   = re.compile(r'(?:Facture|Invoice|N[°o])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
-INVOICE_NUM_RE = re.compile(r'Num[ée]ro\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
+# numéro facture: "Numéro :", "Facture", "FACTURE N°", "Invoice", "N°"
+NUM_RE = re.compile(
+    r'(?:Facture|FACTURE\s*N[°ºo]|Invoice|N[°ºo])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})',
+    re.I
+)
+INVOICE_NUM_RE = re.compile(
+    r'(?:Num[ée]ro|FACTURE\s*N[°ºo])\s*[:#]?\s*([A-Z0-9\-\/\.]{3,})',
+    re.I
+)
 DATE_RE  = re.compile(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})')
 
 TOTAL_TTC_NEAR_RE = re.compile(
