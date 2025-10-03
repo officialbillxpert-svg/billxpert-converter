@@ -1,87 +1,254 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
-# on importe seulement ce qui est stable
-from .patterns import TABLE_HEADER_HINTS, FOOTER_NOISE_PAT
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None  # type: ignore
 
-# Fallback local (au cas où)
-LINE_RX_FALLBACK = re.compile(
-    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
-    r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
-    re.M
-)
+from .patterns import TABLE_HEADER_HINTS, FOOTER_NOISE_PAT, LINE_RX
+from .utils_amounts import _norm_amount
 
 def parse_lines_regex(text: str) -> List[Dict[str, Any]]:
-    """
-    Parsing simple par regex (fallback). Ne dépend pas de pdfminer.
-    """
-    if not text:
-        return []
-    # tenter d’utiliser LINE_RX défini dans patterns, sinon fallback local
-    try:
-        from .patterns import LINE_RX as PAT_LINE_RX  # import tardif = safe
-        rx = PAT_LINE_RX or LINE_RX_FALLBACK
-    except Exception:
-        rx = LINE_RX_FALLBACK
-
     rows: List[Dict[str, Any]] = []
-    for m in rx.finditer(text):
-        ref   = (m.group("ref") or "").strip()
-        label = (m.group("label") or "").strip()
-        qty   = _to_float(m.group("qty"))
-        pu    = _norm_amount(m.group("pu"))
-        amt   = _norm_amount(m.group("amt"))
+    for m in LINE_RX.finditer(text or ""):
+        qty = int(m.group('qty'))
+        pu  = _norm_amount(m.group('pu'))
+        amt = _norm_amount(m.group('amt'))
+        if FOOTER_NOISE_PAT.search((m.group('label') or '') + ' ' + (m.group('ref') or '')):
+            continue
         rows.append({
-            "ref": ref or None,
-            "label": label or None,
-            "qty": qty,
+            "ref":        m.group('ref'),
+            "label":      m.group('label').strip(),
+            "qty":        qty,
             "unit_price": pu,
-            "amount": amt,
+            "amount":     amt
         })
-    # filtre le bruit de pied de page
-    rows = [r for r in rows if not _looks_like_footer(r.get("label") or "")]
     return rows
 
+def _norm_header_cell(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = (s.replace("é","e").replace("è","e").replace("ê","e")
+           .replace("à","a").replace("û","u").replace("ï","i"))
+    s = s.replace("\n"," ").replace("\t"," ")
+    s = re.sub(r"\s+"," ", s)
+    return s
+
+def _map_header_indices(headers: List[str]) -> Optional[Dict[str, int]]:
+    idx: Dict[str, Optional[int]] = {}
+    norm = [_norm_header_cell(h) for h in headers]
+    def match_one(*cands):
+        for i, h in enumerate(norm):
+            for c in cands:
+                if c in h:
+                    return i
+        return None
+    idx["ref"]    = match_one(*TABLE_HEADER_HINTS[0])
+    idx["label"]  = match_one(*TABLE_HEADER_HINTS[1])
+    idx["qty"]    = match_one(*TABLE_HEADER_HINTS[2])
+    idx["unit"]   = match_one(*TABLE_HEADER_HINTS[3])
+    idx["amount"] = match_one(*TABLE_HEADER_HINTS[4])
+    if all(v is None for v in idx.values()):
+        return None
+    return {k: v for k, v in idx.items() if v is not None}
+
 def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
-    """
-    Si tu as une parse par positions X (pdfminer layout), garde-la ici.
-    Pour l’instant, on renvoie [] pour éviter les crash sur PDFs scannés.
-    """
-    return []
+    if pdfplumber is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
+                if not words:
+                    continue
+                lines_by_y: Dict[int, List[dict]] = {}
+                for w in words:
+                    mid_y = int((w["top"] + w["bottom"]) / 2)
+                    lines_by_y.setdefault(mid_y, []).append(w)
+                header_y = None
+                header_cells: Dict[str, dict] = {}
+                def norm(s: str) -> str:
+                    return _norm_header_cell(s)
+                for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
+                    score, hitmap = 0, {}
+                    for w in ws:
+                        t = norm(w["text"])
+                        if any(c in t for c in TABLE_HEADER_HINTS[2]): score += 1; hitmap["qty"]   = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[3]): score += 1; hitmap["unit"]  = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[4]): score += 1; hitmap["amount"]= w
+                        if any(c in t for c in TABLE_HEADER_HINTS[1]): score += 1; hitmap["label"] = w
+                        if any(c in t for c in TABLE_HEADER_HINTS[0]): score += 1; hitmap["ref"]   = w
+                    if score >= 3:
+                        header_y = yk
+                        header_cells = hitmap
+                        break
+                if header_y is None:
+                    continue
+                total_y = None
+                for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
+                    if yk <= header_y:
+                        continue
+                    txt = " ".join(norm(w["text"]) for w in ws)
+                    if "total" in txt:
+                        total_y = yk
+                        break
+                cols = []
+                for role in ["ref", "label", "qty", "unit", "amount"]:
+                    if role in header_cells:
+                        w = header_cells[role]
+                        cols.append((role, (w["x0"] + w["x1"]) / 2))
+                cols = sorted(cols, key=lambda t: t[1])
+                if not cols:
+                    continue
+                col_bounds: List[Tuple[str, float, float]] = []
+                for i, (role, xmid) in enumerate(cols):
+                    if i == 0:
+                        left = 0.0
+                        right = (cols[i+1][1] + xmid) / 2 if i+1 < len(cols) else xmid + 9999
+                    elif i == len(cols) - 1:
+                        left = (cols[i-1][1] + xmid) / 2
+                        right = 999999.0
+                    else:
+                        left = (cols[i-1][1] + xmid) / 2
+                        right = (cols[i+1][1] + xmid) / 2
+                    col_bounds.append((role, left, right))
+                def in_body(yk: int) -> bool:
+                    if yk <= header_y + 5:
+                        return False
+                    if total_y is not None and yk >= total_y - 5:
+                        return False
+                    return True
+                bands: List[Tuple[int, List[dict]]] = []
+                for yk in sorted(lines_by_y.keys()):
+                    if not in_body(yk):
+                        continue
+                    ws = sorted(lines_by_y[yk], key=lambda w: w["x0"])
+                    if not bands:
+                        bands.append((yk, ws))
+                    else:
+                        last_y, last_ws = bands[-1]
+                        if abs(yk - last_y) <= 6:
+                            last_ws.extend(ws)
+                        else:
+                            bands.append((yk, ws))
+                for _, ws in bands:
+                    full_text = " ".join(w["text"] for w in ws)
+                    if FOOTER_NOISE_PAT.search(full_text):
+                        continue
+                    cells: Dict[str, List[str]] = {role: [] for (role, _, _) in col_bounds}
+                    for w in ws:
+                        xmid = (w["x0"] + w["x1"]) / 2
+                        for role, left, right in col_bounds:
+                            if left <= xmid < right:
+                                cells[role].append(w["text"])
+                                break
+                    ref   = " ".join(cells.get("ref", [])).strip() or None
+                    label = " ".join(cells.get("label", [])).strip() or None
+                    qtys  = " ".join(cells.get("qty", [])).strip()
+                    pu    = " ".join(cells.get("unit", [])).strip()
+                    amt   = " ".join(cells.get("amount", [])).strip()
+                    def _to_int(s: str) -> Optional[int]:
+                        s2 = re.sub(r"[^\d]", "", s or "")
+                        if not s2:
+                            return None
+                        try:
+                            val = int(s2)
+                            if val < 0 or val > 999:
+                                return None
+                            return val
+                        except Exception:
+                            return None
+                    qty_i  = _to_int(qtys)
+                    pu_f   = _norm_amount(pu)
+                    amt_f  = _norm_amount(amt)
+                    if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
+                        continue
+                    if not (label or pu_f is not None or amt_f is not None or qty_i is not None or ref):
+                        continue
+                    if (not label) and ref:
+                        label = ref
+                    if amt_f is None and (pu_f is not None) and (qty_i is not None):
+                        amt_f = round(pu_f * qty_i, 2)
+                    if (qty_i is not None) and (not label) and (pu_f is None) and (amt_f is None):
+                        continue
+                    if label and FOOTER_NOISE_PAT.search(label):
+                        continue
+                    rows.append({
+                        "ref":        ref,
+                        "label":      label or "",
+                        "qty":        qty_i,
+                        "unit_price": pu_f,
+                        "amount":     amt_f
+                    })
+        uniq, seen = [], set()
+        for r in rows:
+            key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
+        return uniq
+    except Exception:
+        return []
 
 def parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
-    """
-    Si tu as un extracteur de tableau (camelot/tabula), mets-le ici.
-    Par défaut, désactivé (évite dépendances système).
-    """
-    return []
-
-# ---------- utils locaux ----------
-_AMT_RX = re.compile(r'[^\d,.\-]')
-
-def _to_float(x) -> float | None:
+    if pdfplumber is None:
+        return []
+    rows: List[Dict[str, Any]] = []
     try:
-        return float(x)
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = []
+                t = page.extract_table()
+                if t: tables.append(t)
+                t2 = page.extract_table({"vertical_strategy":"lines", "horizontal_strategy":"lines"})
+                if t2: tables.append(t2)
+                for tbl in tables:
+                    tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
+                    if not tbl or len(tbl) < 2:
+                        continue
+                    header = tbl[0]
+                    idx = _map_header_indices(header)
+                    if not idx:
+                        continue
+                    for line in tbl[1:]:
+                        def get(i: Optional[int]) -> str:
+                            return line[i] if (i is not None and i < len(line)) else ""
+                        ref   = get(idx.get("ref"))
+                        label = get(idx.get("label")) or ref
+                        qty   = get(idx.get("qty"))
+                        pu    = get(idx.get("unit"))
+                        amt   = get(idx.get("amount"))
+                        try:
+                            qty_i = int(re.sub(r"[^\d]", "", qty)) if qty else None
+                            if qty_i is not None and (qty_i < 0 or qty_i > 999):
+                                qty_i = None
+                        except Exception:
+                            qty_i = None
+                        pu_f  = _norm_amount(pu)
+                        amt_f = _norm_amount(amt)
+                        if amt_f is None and pu_f is not None and qty_i is not None:
+                            amt_f = round(pu_f * qty_i, 2)
+                        if not (label or pu_f is not None or amt_f is not None or qty_i is not None):
+                            continue
+                        if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
+                            continue
+                        rows.append({
+                            "ref":        (ref or "").strip() or None,
+                            "label":      (label or "").strip(),
+                            "qty":        qty_i,
+                            "unit_price": pu_f,
+                            "amount":     amt_f
+                        })
+        uniq, seen = [], set()
+        for r in rows:
+            key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
+        return uniq
     except Exception:
-        return None
-
-def _norm_amount(s: str | None) -> float | None:
-    if not s:
-        return None
-    # supprime symboles/espaces, normalise séparateurs
-    t = _AMT_RX.sub('', s).strip().replace(' ', '')
-    # gestion "1 234,56" / "1.234,56" / "1234.56"
-    if t.count(',') == 1 and t.count('.') >= 1:
-        # cas "1.234,56" -> remplace '.' (milliers) par '' puis ',' -> '.'
-        t = t.replace('.', '').replace(',', '.')
-    elif t.count(',') == 1 and t.count('.') == 0:
-        # cas "1234,56"
-        t = t.replace(',', '.')
-    try:
-        return round(float(t), 2)
-    except Exception:
-        return None
-
-def _looks_like_footer(label: str) -> bool:
-    return bool(FOOTER_NOISE_PAT.search(label or ""))
+        return []
