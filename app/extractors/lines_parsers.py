@@ -1,22 +1,21 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
-from pathlib import Path
+import re
 
-from .patterns import LINE_RX, FOOTER_NOISE_PAT
-from .utils_amounts import norm_amount, norm_header_cell, map_header_indices
-
-# pdfplumber optionnel
 try:
     import pdfplumber
 except Exception:
     pdfplumber = None  # type: ignore
 
+from .patterns import TABLE_HEADER_HINTS, FOOTER_NOISE_PAT, LINE_RX
+from .utils_amounts import _norm_amount
+
 def parse_lines_regex(text: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for m in LINE_RX.finditer(text or ""):
         qty = int(m.group('qty'))
-        pu  = norm_amount(m.group('pu'))
-        amt = norm_amount(m.group('amt'))
+        pu  = _norm_amount(m.group('pu'))
+        amt = _norm_amount(m.group('amt'))
         if FOOTER_NOISE_PAT.search((m.group('label') or '') + ' ' + (m.group('ref') or '')):
             continue
         rows.append({
@@ -28,6 +27,32 @@ def parse_lines_regex(text: str) -> List[Dict[str, Any]]:
         })
     return rows
 
+def _norm_header_cell(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = (s.replace("é","e").replace("è","e").replace("ê","e")
+           .replace("à","a").replace("û","u").replace("ï","i"))
+    s = s.replace("\n"," ").replace("\t"," ")
+    s = re.sub(r"\s+"," ", s)
+    return s
+
+def _map_header_indices(headers: List[str]) -> Optional[Dict[str, int]]:
+    idx: Dict[str, Optional[int]] = {}
+    norm = [_norm_header_cell(h) for h in headers]
+    def match_one(*cands):
+        for i, h in enumerate(norm):
+            for c in cands:
+                if c in h:
+                    return i
+        return None
+    idx["ref"]    = match_one(*TABLE_HEADER_HINTS[0])
+    idx["label"]  = match_one(*TABLE_HEADER_HINTS[1])
+    idx["qty"]    = match_one(*TABLE_HEADER_HINTS[2])
+    idx["unit"]   = match_one(*TABLE_HEADER_HINTS[3])
+    idx["amount"] = match_one(*TABLE_HEADER_HINTS[4])
+    if all(v is None for v in idx.values()):
+        return None
+    return {k: v for k, v in idx.items() if v is not None}
+
 def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
     if pdfplumber is None:
         return []
@@ -38,15 +63,14 @@ def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                 words = page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
                 if not words:
                     continue
-                lines_by_y = {}
+                lines_by_y: Dict[int, List[dict]] = {}
                 for w in words:
                     mid_y = int((w["top"] + w["bottom"]) / 2)
                     lines_by_y.setdefault(mid_y, []).append(w)
-
-                # header
-                header_y, header_cells = None, {}
-                def norm(s: str) -> str: return norm_header_cell(s)
-                from .patterns import TABLE_HEADER_HINTS
+                header_y = None
+                header_cells: Dict[str, dict] = {}
+                def norm(s: str) -> str:
+                    return _norm_header_cell(s)
                 for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
                     score, hitmap = 0, {}
                     for w in ws:
@@ -57,12 +81,11 @@ def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         if any(c in t for c in TABLE_HEADER_HINTS[1]): score += 1; hitmap["label"] = w
                         if any(c in t for c in TABLE_HEADER_HINTS[0]): score += 1; hitmap["ref"]   = w
                     if score >= 3:
-                        header_y, header_cells = yk, hitmap
+                        header_y = yk
+                        header_cells = hitmap
                         break
                 if header_y is None:
                     continue
-
-                # fin de tableau (ligne "total")
                 total_y = None
                 for yk, ws in sorted(lines_by_y.items(), key=lambda kv: kv[0]):
                     if yk <= header_y:
@@ -71,7 +94,6 @@ def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                     if "total" in txt:
                         total_y = yk
                         break
-
                 cols = []
                 for role in ["ref", "label", "qty", "unit", "amount"]:
                     if role in header_cells:
@@ -80,7 +102,6 @@ def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                 cols = sorted(cols, key=lambda t: t[1])
                 if not cols:
                     continue
-
                 col_bounds: List[Tuple[str, float, float]] = []
                 for i, (role, xmid) in enumerate(cols):
                     if i == 0:
@@ -93,29 +114,30 @@ def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                         left = (cols[i-1][1] + xmid) / 2
                         right = (cols[i+1][1] + xmid) / 2
                     col_bounds.append((role, left, right))
-
                 def in_body(yk: int) -> bool:
-                    if yk <= header_y + 5: return False
-                    if total_y is not None and yk >= total_y - 5: return False
+                    if yk <= header_y + 5:
+                        return False
+                    if total_y is not None and yk >= total_y - 5:
+                        return False
                     return True
-
-                # regrouper bandes
                 bands: List[Tuple[int, List[dict]]] = []
                 for yk in sorted(lines_by_y.keys()):
-                    if not in_body(yk): continue
+                    if not in_body(yk):
+                        continue
                     ws = sorted(lines_by_y[yk], key=lambda w: w["x0"])
-                    if not bands: bands.append((yk, ws))
+                    if not bands:
+                        bands.append((yk, ws))
                     else:
                         last_y, last_ws = bands[-1]
-                        if abs(yk - last_y) <= 6: last_ws.extend(ws)
-                        else: bands.append((yk, ws))
-
-                from .patterns import FOOTER_NOISE_PAT
-                import re
+                        if abs(yk - last_y) <= 6:
+                            last_ws.extend(ws)
+                        else:
+                            bands.append((yk, ws))
                 for _, ws in bands:
                     full_text = " ".join(w["text"] for w in ws)
-                    if FOOTER_NOISE_PAT.search(full_text): continue
-                    cells = {role: [] for (role, _, _) in col_bounds}
+                    if FOOTER_NOISE_PAT.search(full_text):
+                        continue
+                    cells: Dict[str, List[str]] = {role: [] for (role, _, _) in col_bounds}
                     for w in ws:
                         xmid = (w["x0"] + w["x1"]) / 2
                         for role, left, right in col_bounds:
@@ -129,34 +151,44 @@ def parse_lines_by_xpos(pdf_path: str) -> List[Dict[str, Any]]:
                     amt   = " ".join(cells.get("amount", [])).strip()
                     def _to_int(s: str) -> Optional[int]:
                         s2 = re.sub(r"[^\d]", "", s or "")
-                        if not s2: return None
+                        if not s2:
+                            return None
                         try:
                             val = int(s2)
-                            if val < 0 or val > 999: return None
+                            if val < 0 or val > 999:
+                                return None
                             return val
                         except Exception:
                             return None
                     qty_i  = _to_int(qtys)
-                    pu_f   = norm_amount(pu)
-                    amt_f  = norm_amount(amt)
-
-                    if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")): continue
-                    if not (label or pu_f is not None or amt_f is not None or qty_i is not None or ref): continue
-                    if (not label) and ref: label = ref
-                    if amt_f is None and (pu_f is not None) and (qty_i is not None): amt_f = round(pu_f * qty_i, 2)
-                    if (qty_i is not None) and (not label) and (pu_f is None) and (amt_f is None): continue
-                    if label and FOOTER_NOISE_PAT.search(label): continue
-
+                    pu_f   = _norm_amount(pu)
+                    amt_f  = _norm_amount(amt)
+                    if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
+                        continue
+                    if not (label or pu_f is not None or amt_f is not None or qty_i is not None or ref):
+                        continue
+                    if (not label) and ref:
+                        label = ref
+                    if amt_f is None and (pu_f is not None) and (qty_i is not None):
+                        amt_f = round(pu_f * qty_i, 2)
+                    if (qty_i is not None) and (not label) and (pu_f is None) and (amt_f is None):
+                        continue
+                    if label and FOOTER_NOISE_PAT.search(label):
+                        continue
                     rows.append({
-                        "ref": ref, "label": label or "", "qty": qty_i,
-                        "unit_price": pu_f, "amount": amt_f
+                        "ref":        ref,
+                        "label":      label or "",
+                        "qty":        qty_i,
+                        "unit_price": pu_f,
+                        "amount":     amt_f
                     })
-
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
-            if key in seen: continue
-            seen.add(key); uniq.append(r)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
         return uniq
     except Exception:
         return []
@@ -173,41 +205,50 @@ def parse_lines_extract_table(pdf_path: str) -> List[Dict[str, Any]]:
                 if t: tables.append(t)
                 t2 = page.extract_table({"vertical_strategy":"lines", "horizontal_strategy":"lines"})
                 if t2: tables.append(t2)
-                from .utils_amounts import map_header_indices
-                from .patterns import FOOTER_NOISE_PAT
                 for tbl in tables:
                     tbl = [[(c or "").strip() for c in (row or [])] for row in (tbl or []) if any((row or []))]
-                    if not tbl or len(tbl) < 2: continue
+                    if not tbl or len(tbl) < 2:
+                        continue
                     header = tbl[0]
-                    idx = map_header_indices(header)
-                    if not idx: continue
-                    import re
+                    idx = _map_header_indices(header)
+                    if not idx:
+                        continue
                     for line in tbl[1:]:
-                        def get(i): return line[i] if (i is not None and i < len(line)) else ""
-                        ref, label = get(idx.get("ref")), get(idx.get("label"))
-                        qty, pu, amt = get(idx.get("qty")), get(idx.get("unit")), get(idx.get("amount"))
+                        def get(i: Optional[int]) -> str:
+                            return line[i] if (i is not None and i < len(line)) else ""
+                        ref   = get(idx.get("ref"))
+                        label = get(idx.get("label")) or ref
+                        qty   = get(idx.get("qty"))
+                        pu    = get(idx.get("unit"))
+                        amt   = get(idx.get("amount"))
                         try:
                             qty_i = int(re.sub(r"[^\d]", "", qty)) if qty else None
-                            if qty_i is not None and (qty_i < 0 or qty_i > 999): qty_i = None
+                            if qty_i is not None and (qty_i < 0 or qty_i > 999):
+                                qty_i = None
                         except Exception:
                             qty_i = None
-                        from .utils_amounts import norm_amount
-                        pu_f, amt_f = norm_amount(pu), norm_amount(amt)
-                        if amt_f is None and pu_f is not None and qty_i is not None: amt_f = round(pu_f * qty_i, 2)
-                        if not (label or pu_f is not None or amt_f is not None or qty_i is not None): continue
-                        if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")): continue
+                        pu_f  = _norm_amount(pu)
+                        amt_f = _norm_amount(amt)
+                        if amt_f is None and pu_f is not None and qty_i is not None:
+                            amt_f = round(pu_f * qty_i, 2)
+                        if not (label or pu_f is not None or amt_f is not None or qty_i is not None):
+                            continue
+                        if FOOTER_NOISE_PAT.search((label or "") + " " + (ref or "")):
+                            continue
                         rows.append({
-                            "ref": (ref or "").strip() or None,
-                            "label": (label or ref or "").strip(),
-                            "qty": qty_i,
+                            "ref":        (ref or "").strip() or None,
+                            "label":      (label or "").strip(),
+                            "qty":        qty_i,
                             "unit_price": pu_f,
-                            "amount": amt_f
+                            "amount":     amt_f
                         })
         uniq, seen = [], set()
         for r in rows:
             key = (r.get("ref"), r.get("label"), r.get("qty"), r.get("unit_price"), r.get("amount"))
-            if key in seen: continue
-            seen.add(key); uniq.append(r)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
         return uniq
     except Exception:
         return []
