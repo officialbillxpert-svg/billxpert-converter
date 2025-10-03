@@ -12,42 +12,31 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 # --- Extractor ---
+# Supporte: `python -m app.main` (import relatif) ET `python app/main.py` (import absolu)
 try:
     from .extractors.pdf_basic import extract_document as _extract
 except Exception:
-    from .extractors.pdf_basic import extract_pdf as _extract  # type: ignore
+    from extractors.pdf_basic import extract_document as _extract  # type: ignore
 
 ALLOWED_EXTS = {".pdf", ".png", ".jpg", ".jpeg"}
 
 app = Flask(__name__)
 CORS(app)
 
-# --- DIAG TESSERACT ---
-@app.get("/diag")
-def diag():
-    import shutil, subprocess
-    try:
-        import pytesseract
-        pt_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
-    except Exception:
-        pytesseract = None
-        pt_cmd = None
+# Limite de taille d’upload (25 Mo)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
-    which = shutil.which("tesseract")
-    langs, err = None, None
-    try:
-        out = subprocess.check_output(["tesseract","--list-langs"], stderr=subprocess.STDOUT, text=True)
-        langs = [l.strip() for l in out.splitlines() if l.strip() and not l.lower().startswith("list of")]
-    except Exception as e:
-        err = str(e)
 
-    return jsonify({
-        "which_tesseract": which,
-        "pytesseract_cmd": pt_cmd,
-        "TESSDATA_PREFIX": os.environ.get("TESSDATA_PREFIX"),
-        "langs": langs,
-        "list_langs_error": err,
-    })
+# ---------- Helpers ----------
+def _json_ok(data: Dict[str, Any], status: int = 200):
+    resp = jsonify(data)
+    resp.status_code = status
+    return resp
+
+
+def _json_err(error: str, details: str = "", status: int = 400):
+    return _json_ok({"success": False, "error": error, "details": details}, status=status)
+
 
 def _save_upload_to_tmp() -> Path:
     if "file" not in request.files:
@@ -67,17 +56,39 @@ def _save_upload_to_tmp() -> Path:
     tmp.close()
     return Path(tmp.name)
 
-def _json_ok(data: Dict[str, Any], status: int = 200):
-    resp = jsonify(data)
-    resp.status_code = status
-    return resp
 
-def _json_err(error: str, details: str = "", status: int = 400):
-    return _json_ok({"success": False, "error": error, "details": details}, status=status)
-
+# ---------- Routes ----------
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
+
+@app.get("/diag")
+def diag():
+    import shutil, subprocess
+    try:
+        import pytesseract
+        pt_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
+    except Exception:
+        pytesseract = None  # noqa: F841
+        pt_cmd = None
+
+    which = shutil.which("tesseract")
+    langs, err = None, None
+    try:
+        out = subprocess.check_output(["tesseract", "--list-langs"], stderr=subprocess.STDOUT, text=True)
+        langs = [l.strip() for l in out.splitlines() if l.strip() and not l.lower().startswith("list of")]
+    except Exception as e:
+        err = str(e)
+
+    return jsonify({
+        "which_tesseract": which,
+        "pytesseract_cmd": pt_cmd,
+        "TESSDATA_PREFIX": os.environ.get("TESSDATA_PREFIX"),
+        "langs": langs,
+        "list_langs_error": err,
+    })
+
 
 @app.post("/api/convert")
 def api_convert():
@@ -91,8 +102,11 @@ def api_convert():
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try: os.unlink(path)
-        except Exception: pass
+        try:
+            Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
 
 @app.post("/api/summary")
 def api_summary():
@@ -102,6 +116,7 @@ def api_summary():
         return _json_err("bad_request", str(e), 400)
     try:
         data = _extract(str(path), ocr="auto") or {}
+        meta = data.get("meta") or {}
         fields = data.get("fields") or {}
         flat = {
             "invoice_number": fields.get("invoice_number"),
@@ -117,8 +132,8 @@ def api_summary():
             "currency":       fields.get("currency"),
             "lines_count":    fields.get("lines_count"),
             # debug
-            "line_strategy":  (data.get("meta") or {}).get("line_strategy"),
-            "ocr_used":       (data.get("meta") or {}).get("ocr_used"),
+            "line_strategy":  meta.get("line_strategy"),
+            "ocr_used":       meta.get("ocr_used"),
         }
         if not data.get("success") and data.get("error"):
             flat.update({"_error": data.get("error"), "_details": data.get("details")})
@@ -126,8 +141,11 @@ def api_summary():
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try: os.unlink(path)
-        except Exception: pass
+        try:
+            Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
 
 @app.post("/api/summary.csv")
 def api_summary_csv():
@@ -137,6 +155,7 @@ def api_summary_csv():
         return _json_err("bad_request", str(e), 400)
     try:
         data = _extract(str(path), ocr="auto") or {}
+        meta = data.get("meta") or {}
         fields = data.get("fields") or {}
         flat = {
             "invoice_number": fields.get("invoice_number"),
@@ -151,20 +170,23 @@ def api_summary_csv():
             "total_ttc":      fields.get("total_ttc"),
             "currency":       fields.get("currency"),
             "lines_count":    fields.get("lines_count"),
-            "line_strategy":  (data.get("meta") or {}).get("line_strategy"),
-            "ocr_used":       (data.get("meta") or {}).get("ocr_used"),
+            "line_strategy":  meta.get("line_strategy"),
+            "ocr_used":       meta.get("ocr_used"),
         }
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=list(flat.keys()), delimiter=';', extrasaction="ignore")
         writer.writeheader()
         writer.writerow(flat)
-        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))
+        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))  # BOM UTF-8 (Excel-friendly)
         return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="billxpert_summary.csv")
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try: os.unlink(path)
-        except Exception: pass
+        try:
+            Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
 
 @app.post("/api/lines")
 def api_lines():
@@ -183,8 +205,11 @@ def api_lines():
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try: os.unlink(path)
-        except Exception: pass
+        try:
+            Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
 
 @app.post("/api/lines.csv")
 def api_lines_csv():
@@ -212,8 +237,12 @@ def api_lines_csv():
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
     finally:
-        try: os.unlink(path)
-        except Exception: pass
+        try:
+            Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
+    # Support des deux modes de lancement
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
