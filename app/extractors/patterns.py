@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 
 # ---------- Version ----------
-PATTERNS_VERSION = "v2025-10-03f"
+PATTERNS_VERSION = "v2025-10-03g"
 
 # ---------- Numéro / Date ----------
 FACTURE_NO_RE = re.compile(
@@ -17,13 +17,14 @@ DATE_RE = re.compile(
 )
 
 # ---------- Totaux ----------
+# Plus tolérant aux confusions OCR ("Total MT", "TTC" variés, espaces, etc.)
 TOTAL_TTC_NEAR_RE = re.compile(
-    r'(?:Total\s*(?:TTC)?|Grand\s*total|Total\s*amount|Total\s*à\s*payer)\s*[:\-]?\s*[^\n\r]{0,60}?'
+    r'(?:Total\s*(?:T[TC]C?|TT[C€]|Grand\s*total|Total\s*amount|Total\s*à\s*payer))\s*[:\-]?\s*[^\n\r]{0,60}?'
     r'([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
 TOTAL_HT_NEAR_RE = re.compile(
-    r'Total\s*HT\s*[:\-]?\s*[^\n\r]{0,60}?([0-9][0-9\.\,\s]+)\s*€?',
+    r'Total\s*[HNM][T1]\s*[:\-]?\s*[^\n\r]{0,60}?([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
 
