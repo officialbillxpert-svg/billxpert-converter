@@ -7,7 +7,6 @@ import re
 from . import patterns as P
 from .utils_amounts import _norm_amount, _clean_block
 
-
 def _fill_fields_from_text(result: dict, text: str) -> None:
     fields = result["fields"]
 
