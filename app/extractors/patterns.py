@@ -1,4 +1,3 @@
-@'
 from __future__ import annotations
 import re
 
@@ -91,4 +90,3 @@ __all__ = [
     "SELLER_BLOCK", "CLIENT_BLOCK", "EMETTEUR_BLOCK", "DESTINATAIRE_BLOCK",
     "TABLE_HEADER_HINTS", "FOOTER_NOISE_PAT", "LINE_RX",
 ]
-'@ | Set-Content app\extractors\patterns.py
