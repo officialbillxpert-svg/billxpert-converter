@@ -7,17 +7,13 @@ from .io_pdf_image import pdf_text, ocr_image_to_text
 from .fields import _fill_fields_from_text
 from .totals import _infer_totals
 from .lines_parsers import parse_lines_by_xpos, parse_lines_extract_table, parse_lines_regex
-from .utils_amounts import approx
+from .utils_amounts import approx as approx_utils
 
-def _extract_vat_rate(text: str) -> str | None:
-    m_vr = VAT_RATE_RE.search(text or "")
-    if not m_vr:
-        return None
-    vr = m_vr.group(1)
-    return "5.5" if vr in ("5,5", "5.5") else vr
+def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
+    p = Path(path)
+    ext = p.suffix.lower()
 
-def _empty_result(p: Path) -> Dict[str, Any]:
-    return {
+    result: Dict[str, Any] = {
         "success": True,
         "meta": {
             "bytes": p.stat().st_size if p.exists() else None,
@@ -25,7 +21,7 @@ def _empty_result(p: Path) -> Dict[str, Any]:
             "pages": 0,
             "ocr_used": False,
             "ocr_pages": 0,
-            "from_images": p.suffix.lower() in {".png", ".jpg", ".jpeg"},
+            "from_images": ext in {".png", ".jpg", ".jpeg"},
             "line_strategy": "none",
             "patterns_version": PATTERNS_VERSION,
             "warnings": [],
@@ -40,107 +36,94 @@ def _empty_result(p: Path) -> Dict[str, Any]:
         },
         "text": "",
         "text_preview": "",
-        "provenance": {},  # where fields came from
-        "confidences": {}, # 0..1
     }
-
-def _push_warn(meta: Dict[str, Any], msg: str) -> None:
-    (meta.setdefault("warnings", [])).append(msg)
-
-def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
-    p = Path(path)
-    ext = p.suffix.lower()
-
-    result = _empty_result(p)
     fields = result["fields"]
-    meta = result["meta"]
 
-    # -------- IMAGES -> OCR ----------
+    # --- Images -> OCR direct
     if ext in {".png", ".jpg", ".jpeg"}:
-        txt, info = ocr_image_to_text(p, lang="fra+eng")
-        if info.get("error"):
-            result["success"] = False
-            result.update(info)  # surface error to caller
+        try:
+            txt, info = ocr_image_to_text(p, lang="fra+eng")
+            result["meta"]["ocr_used"] = True
+            result["meta"]["ocr_pages"] = 1
+            if "ocr_lang" in info: result["meta"]["ocr_lang"] = info["ocr_lang"]
+            if "warnings" in info: result["meta"]["warnings"] += info.get("warnings", [])
+            result["text"] = txt[:20000]
+            result["text_preview"] = txt[:2000]
+            _fill_fields_from_text(result, txt)
+
+            # Lignes (regex fallback sur OCR)
+            lines = parse_lines_regex(txt)
+            if lines:
+                result["lines"] = lines
+                result["meta"]["line_strategy"] = "regex"
+                fields["lines_count"] = len(lines)
+
+                vat_rate  = _extract_vat_rate(txt)
+                total_ttc = fields.get("total_ttc")
+                sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
+
+                if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
+                    th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
+                    if th is not None: fields["total_ht"]  = th
+                    if tv is not None: fields["total_tva"] = tv
+                    fields["total_ttc"] = tt or total_ttc
+                else:
+                    total_ht = sum_lines if sum_lines else fields.get("total_ht")
+                    th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
+                    if th is not None: fields["total_ht"]  = th
+                    if tv is not None: fields["total_tva"] = tv
+                    if tt is not None: fields["total_ttc"] = tt
+
+            # Post-pass TVA
+            if (fields.get("total_tva") is None 
+                and fields.get("total_ttc") is not None 
+                and fields.get("total_ht")  is not None):
+                diff = round(fields["total_ttc"] - fields["total_ht"], 2)
+                if 0 <= diff <= 2_000_000:
+                    fields["total_tva"] = diff
+
             return result
 
-        meta["ocr_used"] = True
-        meta["ocr_pages"] = 1
-        if "ocr_lang" in info: meta["ocr_lang"] = info["ocr_lang"]
-        if "ocr_engine" in info: meta["ocr_engine"] = info["ocr_engine"]
+        except RuntimeError as e:
+            # OCR KO : on renvoie une erreur claire sans crasher le serveur
+            result["success"] = False
+            result["error"] = str(e)
+            result["details"] = "Tesseract process timeout" if "timeout" in str(e).lower() else "OCR failed"
+            result["meta"]["ocr_used"] = False
+            result["meta"]["ocr_pages"] = 0
+            return result
 
-        result["text"] = txt[:20000]
-        result["text_preview"] = txt[:2000]
-
-        _fill_fields_from_text(result, txt)
-        vat_rate = _extract_vat_rate(txt)
-
-        # Lignes depuis texte OCR (regex)
-        lines = parse_lines_regex(txt)
-        if lines:
-            result["lines"] = lines
-            meta["line_strategy"] = "regex"
-            fields["lines_count"] = len(lines)
-
-            sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
-            total_ttc = fields.get("total_ttc")
-
-            if total_ttc and sum_lines and approx(sum_lines, total_ttc, tol=1.5):
-                th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
-                if th is not None: fields["total_ht"]  = th
-                if tv is not None: fields["total_tva"] = tv
-                fields["total_ttc"] = tt or total_ttc
-            else:
-                total_ht = sum_lines if sum_lines else fields.get("total_ht")
-                th, tv, tt = _infer_totals(total_ttc, total_ht, fields.get("total_tva"), vat_rate)
-                if th is not None: fields["total_ht"]  = th
-                if tv is not None: fields["total_tva"] = tv
-                if tt is not None: fields["total_ttc"] = tt
-
-        # Post-pass: ensure TVA
-        if (fields.get("total_tva") is None and fields.get("total_ttc") is not None and fields.get("total_ht") is not None):
-            diff = round(fields["total_ttc"] - fields["total_ht"], 2)
-            if 0 <= diff <= 2_000_000:
-                fields["total_tva"] = diff
-
-        # Sanity: huge TTC likely decimal glitch
-        if fields.get("total_ttc") and fields["total_ttc"] >= 100000 and fields.get("total_ht"):
-            if abs(fields["total_ttc"]/100.0 - (fields["total_ht"] + (fields.get("total_tva") or 0))) < 5:
-                _push_warn(meta, "Adjusted TTC scale by /100 due to OCR thousands glitch.")
-                fields["total_ttc"] = round(fields["total_ttc"]/100.0, 2)
-
-        return result
-
-    # -------- PDF ----------
+    # --- PDF texte natif (pdfminer)
     text = pdf_text(p) or ""
     result["text"] = text[:20000]
     result["text_preview"] = text[:2000]
-    meta["pages"] = (text.count("\f") + 1) if text else 0
+    result["meta"]["pages"] = (text.count("\f") + 1) if text else 0
 
     _fill_fields_from_text(result, text)
-    vat_rate = _extract_vat_rate(text)
 
-    # Lignes: xpos -> table -> regex
-    lines: List[Dict[str, Any]] = parse_lines_by_xpos(str(p))
+    # Lignes
+    lines = parse_lines_by_xpos(str(p))
     if lines:
         result["lines"] = lines
-        meta["line_strategy"] = "xpos"
+        result["meta"]["line_strategy"] = "xpos"
     else:
         lines = parse_lines_extract_table(str(p))
         if lines:
             result["lines"] = lines
-            meta["line_strategy"] = "table"
+            result["meta"]["line_strategy"] = "table"
         else:
             lines = parse_lines_regex(text)
             if lines:
                 result["lines"] = lines
-                meta["line_strategy"] = "regex"
+                result["meta"]["line_strategy"] = "regex"
 
     if lines:
         fields["lines_count"] = len(lines)
-        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
+        vat_rate  = _extract_vat_rate(text)
         total_ttc = fields.get("total_ttc")
+        sum_lines = round(sum((r.get("amount") or 0.0) for r in lines), 2)
 
-        if total_ttc and sum_lines and approx(sum_lines, total_ttc, tol=1.5):
+        if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
             th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
             fields["total_ht"]  = th
             fields["total_tva"] = tv
@@ -152,16 +135,19 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tv is not None: fields["total_tva"] = tv
             if tt is not None: fields["total_ttc"] = tt
 
-    # Post-pass: ensure TVA
-    if (fields.get("total_tva") is None and fields.get("total_ttc") is not None and fields.get("total_ht") is not None):
+    # Post-pass TVA
+    if (fields.get("total_tva") is None 
+        and fields.get("total_ttc") is not None 
+        and fields.get("total_ht")  is not None):
         diff = round(fields["total_ttc"] - fields["total_ht"], 2)
         if 0 <= diff <= 2_000_000:
             fields["total_tva"] = diff
 
-    # Same TTC scale guard
-    if fields.get("total_ttc") and fields["total_ttc"] >= 100000 and fields.get("total_ht"):
-        if abs(fields["total_ttc"]/100.0 - (fields["total_ht"] + (fields.get("total_tva") or 0))) < 5:
-            _push_warn(meta, "Adjusted TTC scale by /100 due to OCR thousands glitch.")
-            fields["total_ttc"] = round(fields["total_ttc"]/100.0, 2)
-
     return result
+
+def _extract_vat_rate(text: str) -> str | None:
+    m_vat = VAT_RATE_RE.search(text or "")
+    if not m_vat:
+        return None
+    vr = m_vat.group(1)
+    return '5.5' if vr in ('5,5', '5.5') else vr
