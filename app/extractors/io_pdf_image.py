@@ -78,3 +78,34 @@ def pdf_text(path: Path) -> str:
         return extract_text(str(path)) or ""
     except Exception:
         return ""
+
+# ---- PDF -> OCR par pages (fallback pour PDF scannés) ----
+def pdf_ocr_text(path: Path, lang: str = "fra+eng", max_pages: int = 5, dpi: int = 220, timeout_per_page: int = 25) -> Tuple[str, Dict[str, Any]]:
+    """
+    Rasterise jusqu'à 'max_pages' du PDF avec pypdfium2 puis applique Tesseract
+    page par page. Renvoie (texte_concatené, infos).
+    """
+    info: Dict[str, Any] = {"ocr_lang": lang, "ocr_pages": 0}
+    try:
+        import pypdfium2 as pdfium
+    except Exception as e:
+        info.update({"error": "pdf_to_image_unavailable", "details": f"pypdfium2 import failed: {e}"})
+        return "", info
+
+    try:
+        pdf = pdfium.PdfDocument(str(path))
+        n_pages = len(pdf)
+        take = min(n_pages, max_pages)
+        texts: list[str] = []
+        for i in range(take):
+            page = pdf[i]
+            pil = page.render(scale=dpi / 72.0).to_pil()
+            t, run = ocr_image_to_text(pil, lang=lang, timeout=timeout_per_page)
+            if run.get("warnings"):
+                info.setdefault("warnings", []).extend(run["warnings"])
+            texts.append(t or "")
+        info["ocr_pages"] = take
+        return ("\n\f\n".join(texts)).strip(), info
+    except Exception as e:
+        info.update({"error": "pdf_ocr_failed", "details": f"{type(e).__name__}: {e}"})
+        return "", info
