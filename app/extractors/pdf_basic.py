@@ -120,6 +120,22 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
             fields["total_tva"] = diff
 
 
+# ---------- Heuristique “ça ressemble à une facture ?” ----------
+
+def _looks_like_invoice_text(t: str) -> bool:
+    """Heuristique rapide pour détecter du texte 'facture' plausible."""
+    t_low = (t or "").lower()
+    markers = [
+        "facture", "invoice", "total", "tva", "montant", "pu", "qté", "ttc", "t.t.c", "€"
+    ]
+    if any(m in t_low for m in markers):
+        return True
+    # Nombres style 1 234,56 ou 1.234,56
+    if _re.search(r"\b\d{1,3}(?:[ .]\d{3})*(?:[,.]\d{2})\b", t or ""):
+        return True
+    return False
+
+
 # ---------- Extraction principale ----------
 
 def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
@@ -228,10 +244,32 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     result["text_preview"] = text[:2000]
     result["meta"]["pages"] = (text.count("\f") + 1) if text else 0
 
-    # Fallback OCR si le PDF semble scanné (très peu de texte)
-    if len(result["text"]) < 120:
-        ocr_txt, oinfo = pdf_ocr_text(p, lang="fra+eng", max_pages=5, dpi=220, timeout_per_page=25)
+    # On tente d’abord d’extraire les champs sur le texte pdfminer…
+    _fill_fields_from_text(result, text)
+
+    # Décide si on doit basculer en OCR :
+    # - texte trop court
+    # - texte qui ne "ressemble pas" à une facture
+    # - aucun champ clé trouvé (numéro/date/HT/TVA/TTC)
+    empty_core = not any([
+        result["fields"].get("invoice_number"),
+        result["fields"].get("invoice_date"),
+        result["fields"].get("total_ht"),
+        result["fields"].get("total_tva"),
+        result["fields"].get("total_ttc"),
+    ])
+    need_ocr_fallback = (len(result["text"]) < 120) or (not _looks_like_invoice_text(result["text"])) or empty_core
+
+    ocr_used = False
+    if ocr in ("always", "force"):
+        need_ocr_fallback = True
+
+    if need_ocr_fallback:
+        ocr_txt, oinfo = pdf_ocr_text(
+            p, lang="fra+eng", max_pages=5, dpi=280, timeout_per_page=30
+        )
         if ocr_txt:
+            # petites normalisations utiles
             ocr_txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', ocr_txt, flags=_re.I)
             ocr_txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', ocr_txt, flags=_re.I)
 
@@ -239,94 +277,62 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             result["meta"]["ocr_pages"] = oinfo.get("ocr_pages") or 0
             if oinfo.get("warnings"):
                 result["meta"]["warnings"] += oinfo["warnings"]
-            result["text"] = ocr_txt[:20000]
-            result["text_preview"] = ocr_txt[:2000]
 
-            # Champs via OCR
-            _fill_fields_from_text(result, ocr_txt)
+            text = ocr_txt  # -> on bascule le pipeline sur l’OCR
+            result["text"] = text[:20000]
+            result["text_preview"] = text[:2000]
+            ocr_used = True
 
-            # rattrapage montants
-            if fields.get("total_ttc") is None:
-                ttc = _search_amount(ocr_txt, TOTAL_TTC_NEAR_RE)
-                if ttc is not None:
-                    fields["total_ttc"] = ttc
-            if fields.get("total_ht") is None:
-                ht = _search_amount(ocr_txt, TOTAL_HT_NEAR_RE) or _patch_total_ht_fuzzy(ocr_txt)
-                if ht is not None:
-                    fields["total_ht"] = ht
-            if fields.get("total_tva") in (None, 0):
-                tva = _search_amount(ocr_txt, TVA_AMOUNT_NEAR_RE)
-                if tva is not None:
-                    fields["total_tva"] = tva
-
-            # Lignes + totaux
-            lines = parse_lines_regex(ocr_txt)
-            if lines:
-                result["lines"] = lines
-                result["meta"]["line_strategy"] = "regex"
-                fields["lines_count"] = len(lines)
-
-                vat_rate  = _extract_vat_rate(ocr_txt)
-                total_ttc = fields.get("total_ttc")
-                sum_lines = round(sum((_to_num(r.get("amount")) or 0.0) for r in lines), 2)
-
-                if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
-                    th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
-                    if th is not None: fields["total_ht"]  = th
-                    if tv is not None: fields["total_tva"] = tv
-                    fields["total_ttc"] = tt or total_ttc
-                else:
-                    _post_compute_totals(fields, vat_rate)
-            else:
-                vat_rate = _extract_vat_rate(ocr_txt)
-                _post_compute_totals(fields, vat_rate)
-
-            return result
+            # re-parse des champs sur le texte OCR
+            _fill_fields_from_text(result, text)
         else:
+            # OCR a essayé mais rien d’exploitable
             if oinfo.get("error"):
                 result["meta"]["warnings"].append(
                     f"pdf_ocr:{oinfo.get('error')}:{oinfo.get('details','')}".strip()
                 )
 
-    # Champs via patterns (PDF texte natif)
-    _fill_fields_from_text(result, text)
-
-    # Rattrapage montants direct si manquants
-    if fields.get("total_ttc") is None:
+    # --- Rattrapage montants si manquants (marche pour pdfminer OU OCR) ---
+    if result["fields"].get("total_ttc") is None:
         ttc = _search_amount(text, TOTAL_TTC_NEAR_RE)
         if ttc is not None:
-            fields["total_ttc"] = ttc
+            result["fields"]["total_ttc"] = ttc
 
-    if fields.get("total_ht") is None:
+    if result["fields"].get("total_ht") is None:
         ht = _search_amount(text, TOTAL_HT_NEAR_RE)
         if ht is None:
             ht = _patch_total_ht_fuzzy(text)
         if ht is not None:
-            fields["total_ht"] = ht
+            result["fields"]["total_ht"] = ht
 
-    if fields.get("total_tva") in (None, 0):
+    if result["fields"].get("total_tva") in (None, 0):
         tva = _search_amount(text, TVA_AMOUNT_NEAR_RE)
         if tva is not None:
-            fields["total_tva"] = tva
+            result["fields"]["total_tva"] = tva
 
-    # Lignes : déterminer la stratégie réellement utilisée
+    # --- Lignes : déterminer la stratégie réellement utilisée ---
     lines: List[Dict[str, Any]] | None = None
 
-    lx = parse_lines_by_xpos(str(p))
-    if lx:
-        lines = lx
-        result["meta"]["line_strategy"] = "xpos"
-    else:
-        lt = parse_lines_extract_table(str(p))
-        if lt:
-            lines = lt
-            result["meta"]["line_strategy"] = "table"
+    if not ocr_used:
+        # On tente les stratégies 'xpos' / 'table' sur le PDF original uniquement
+        lx = parse_lines_by_xpos(str(p))
+        if lx:
+            lines = lx
+            result["meta"]["line_strategy"] = "xpos"
         else:
-            lr = parse_lines_regex(text)
-            if lr:
-                lines = lr
-                result["meta"]["line_strategy"] = "regex"
+            lt = parse_lines_extract_table(str(p))
+            if lt:
+                lines = lt
+                result["meta"]["line_strategy"] = "table"
 
+    # Si toujours rien, tente une regex sur le texte courant (pdfminer ou OCR)
+    if not lines:
+        lr = parse_lines_regex(text)
+        if lr:
+            lines = lr
+            result["meta"]["line_strategy"] = "regex"
+
+    # --- Totaux à partir des lignes (si présentes) ---
     if lines:
         result["lines"] = lines
         fields["lines_count"] = len(lines)
