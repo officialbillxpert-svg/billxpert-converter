@@ -3,8 +3,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import re as _re
 
-from .patterns import PATTERNS_VERSION, VAT_RATE_RE, TOTAL_TTC_NEAR_RE, TOTAL_HT_NEAR_RE, TVA_AMOUNT_NEAR_RE
-from .io_pdf_image import pdf_text, ocr_image_to_text
+from .patterns import (
+    PATTERNS_VERSION,
+    VAT_RATE_RE,
+    TOTAL_TTC_NEAR_RE,
+    TOTAL_HT_NEAR_RE,
+    TVA_AMOUNT_NEAR_RE,
+)
+from .io_pdf_image import pdf_text, ocr_image_to_text, pdf_ocr_text
 from .fields import _fill_fields_from_text
 from .totals import _infer_totals
 from .lines_parsers import parse_lines_by_xpos, parse_lines_extract_table, parse_lines_regex
@@ -18,11 +24,9 @@ def _norm_amount_str(s: str) -> str:
     if not s:
         return s
     s = s.strip().replace("\u00A0", " ").replace("€", "")
-    # supprime espaces de milliers
-    s = s.replace(" ", "")
-    # heuristique FR -> .
+    s = s.replace(" ", "")  # supprime espaces de milliers
+    # heuristique FR -> '.'
     if "," in s:
-        # si virgule est la dernière séparation décimale, enlever points de milliers
         last_comma = s.rfind(",")
         last_dot = s.rfind(".")
         if last_comma > last_dot:
@@ -38,6 +42,15 @@ def _to_float(s: Optional[str]) -> Optional[float]:
         return float(_norm_amount_str(s))
     except Exception:
         return None
+
+
+def _to_num(v) -> Optional[float]:
+    """Accepte déjà float/int ou str et renvoie float."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    return _to_float(str(v))
 
 
 def _search_amount(text: str, rx: _re.Pattern) -> Optional[float]:
@@ -70,20 +83,17 @@ def _patch_total_ht_fuzzy(text: str) -> Optional[float]:
 def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> None:
     """
     Essaie de compléter HT/TVA/TTC à partir des infos présentes.
-    - Si on a lignes + TTC approximativement égal à somme lignes => HT/TVA par _infer_totals
-    - Sinon, selon combinaison connue (TTC + taux ; HT + taux ; TTC + HT ; etc.)
     """
     total_ht  = fields.get("total_ht")
     total_tva = fields.get("total_tva")
     total_ttc = fields.get("total_ttc")
 
-    # Si HT/TVA pas fiables: 0 est traité comme "manquant"
+    # 0 traité comme manquant (OCR bruité)
     if total_tva == 0:
         total_tva = None
 
     th, tv, tt = _infer_totals(total_ttc, total_ht, total_tva, vat_rate)
 
-    # applique uniquement ce qui est calculable
     if th is not None:
         fields["total_ht"] = th
         total_ht = th
@@ -94,10 +104,12 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
         fields["total_ttc"] = tt
         total_ttc = tt
 
-    # Dernière chance : si TTC & HT présents mais TVA None -> diff
-    if (fields.get("total_tva") in (None, 0)
+    # Dernière chance : TVA = TTC - HT si cohérent
+    if (
+        fields.get("total_tva") in (None, 0)
         and fields.get("total_ttc") is not None
-        and fields.get("total_ht")  is not None):
+        and fields.get("total_ht")  is not None
+    ):
         diff = round(fields["total_ttc"] - fields["total_ht"], 2)
         if 0 <= diff <= 2_000_000:
             fields["total_tva"] = diff
@@ -160,7 +172,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         # Champs via patterns
         _fill_fields_from_text(result, txt)
 
-        # Rattrapage montants avec nos regex directes si manquants
+        # Rattrapage montants si manquants
         if fields.get("total_ttc") is None:
             ttc = _search_amount(txt, TOTAL_TTC_NEAR_RE)
             if ttc is not None:
@@ -187,7 +199,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
             vat_rate  = _extract_vat_rate(txt)
             total_ttc = fields.get("total_ttc")
-            sum_lines = round(sum((_to_float(r.get("amount")) or 0.0) for r in lines), 2)
+            sum_lines = round(sum((_to_num(r.get("amount")) or 0.0) for r in lines), 2)
 
             # Si TTC ~= somme lignes, calculer HT/TVA via infer
             if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
@@ -210,7 +222,66 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     result["text_preview"] = text[:2000]
     result["meta"]["pages"] = (text.count("\f") + 1) if text else 0
 
-    # Champs via patterns
+    # Fallback OCR si le PDF semble scanné (très peu de texte)
+    if len(text) < 120:
+        ocr_txt, oinfo = pdf_ocr_text(p, lang="fra+eng", max_pages=5, dpi=220, timeout_per_page=25)
+        if ocr_txt:
+            ocr_txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', ocr_txt, flags=_re.I)
+            ocr_txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', ocr_txt, flags=_re.I)
+
+            result["meta"]["ocr_used"] = True
+            result["meta"]["ocr_pages"] = oinfo.get("ocr_pages") or 0
+            if oinfo.get("warnings"):
+                result["meta"]["warnings"] += oinfo["warnings"]
+            result["text"] = ocr_txt[:20000]
+            result["text_preview"] = ocr_txt[:2000]
+
+            _fill_fields_from_text(result, ocr_txt)
+
+            # rattrapage montants
+            if (fields.get("total_ttc") is None):
+                ttc = _search_amount(ocr_txt, TOTAL_TTC_NEAR_RE)
+                if ttc is not None:
+                    fields["total_ttc"] = ttc
+            if (fields.get("total_ht") is None):
+                ht = _search_amount(ocr_txt, TOTAL_HT_NEAR_RE) or _patch_total_ht_fuzzy(ocr_txt)
+                if ht is not None:
+                    fields["total_ht"] = ht
+            if (fields.get("total_tva") in (None, 0)):
+                tva = _search_amount(ocr_txt, TVA_AMOUNT_NEAR_RE)
+                if tva is not None:
+                    fields["total_tva"] = tva
+
+            # Lignes + totaux
+            lines = parse_lines_regex(ocr_txt)
+            if lines:
+                result["lines"] = lines
+                result["meta"]["line_strategy"] = "regex"
+                fields["lines_count"] = len(lines)
+
+                vat_rate  = _extract_vat_rate(ocr_txt)
+                total_ttc = fields.get("total_ttc")
+                sum_lines = round(sum((_to_num(r.get("amount")) or 0.0) for r in lines), 2)
+
+                if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
+                    th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
+                    if th is not None: fields["total_ht"]  = th
+                    if tv is not None: fields["total_tva"] = tv
+                    fields["total_ttc"] = tt or total_ttc
+                else:
+                    _post_compute_totals(fields, vat_rate)
+            else:
+                vat_rate = _extract_vat_rate(ocr_txt)
+                _post_compute_totals(fields, vat_rate)
+
+            return result
+        else:
+            if oinfo.get("error"):
+                result["meta"]["warnings"].append(
+                    f"pdf_ocr:{oinfo.get('error')}:{oinfo.get('details','')}".strip()
+                )
+
+    # Champs via patterns (PDF texte natif)
     _fill_fields_from_text(result, text)
 
     # Rattrapage montants direct si manquants
@@ -255,7 +326,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
         vat_rate  = _extract_vat_rate(text)
         total_ttc = fields.get("total_ttc")
-        sum_lines = round(sum((_to_float(r.get("amount")) or 0.0) for r in lines), 2)
+        sum_lines = round(sum((_to_num(r.get("amount")) or 0.0) for r in lines), 2)
 
         if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
             th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
