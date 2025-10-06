@@ -102,6 +102,105 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
             fields["total_tva"] = diff
 
 
+# ---------- Nettoyage et extraction parties (seller/buyer) ----------
+
+_META_NOISE_RX = _re.compile(r"^file://|capture d['’]écran|^\s*\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}", _re.I)
+_STOP_LABELS_RX = _re.compile(
+    r"(?:^|\b)(Description|Désignation|Prix|Unitaire|PU|Qté|Montant|TOTAL|TTC|TVA|RÈGLEMENT|REMIS|IBAN|Conditions?)\b",
+    _re.I
+)
+_SELLER_LABEL_RX = _re.compile(r"(?:^|\s)(?:ÉMETTEUR|EMETTEUR|Émetteur|Emetteur|Vendeur|Seller|From)\s*:?\s*$", _re.I)
+_BUYER_LABEL_RX  = _re.compile(r"(?:^|\s)(?:DESTINATAIRE|Client|Acheteur|Buyer|To)\s*:?\s*$", _re.I)
+
+def _pre_clean_text(t: str) -> str:
+    """Supprime lignes méta (file://, Capture d’écran...), compresse espaces."""
+    if not t:
+        return t
+    out = []
+    for line in (t or "").splitlines():
+        if _META_NOISE_RX.search(line or ""):
+            continue
+        out.append(line.replace("\u00A0", " ").strip())
+    return "\n".join(out)
+
+def _first_nonempty(lines: List[str], start: int) -> int:
+    i = start
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return i
+
+def _block_after_label(lines: List[str], label_idx: int, max_lines: int = 5) -> str:
+    """Prend 1..max_lines lignes après un label, stop si un label/section connue arrive."""
+    i = _first_nonempty(lines, label_idx + 1)
+    collected: List[str] = []
+    for k in range(i, min(i + 12, len(lines))):
+        line = lines[k].strip()
+        if not line:
+            if collected:
+                break
+            else:
+                continue
+        if _STOP_LABELS_RX.search(line):
+            break
+        if _SELLER_LABEL_RX.search(line) or _BUYER_LABEL_RX.search(line):
+            break
+        collected.append(line)
+        if len(collected) >= max_lines:
+            break
+    return "\n".join(collected).strip()
+
+def _fix_parties_from_labels(text: str, fields: Dict[str, Any]) -> None:
+    """Si seller/buyer manquants ou suspects, tente une extraction par proximité de labels."""
+    lines = [l for l in (text or "").splitlines()]
+    # indices des labels
+    seller_block = None
+    buyer_block  = None
+
+    for idx, line in enumerate(lines):
+        if _SELLER_LABEL_RX.search(line):
+            blk = _block_after_label(lines, idx, max_lines=6)
+            if blk and len(blk) >= 6:
+                seller_block = blk
+                break
+
+    for idx, line in enumerate(lines):
+        if _BUYER_LABEL_RX.search(line):
+            blk = _block_after_label(lines, idx, max_lines=6)
+            if blk and len(blk) >= 6:
+                buyer_block = blk
+                break
+
+    def _is_label_only(x: Optional[str]) -> bool:
+        if not x:
+            return True
+        s = x.strip().lower()
+        return s in ("destinataire:", "émetteur:", "emetteur:", "seller:", "buyer:", "client:", "acheteur:")
+
+    # si seller vide ou label-only, on remplace
+    if (not fields.get("seller")) or _is_label_only(fields.get("seller")):
+        if seller_block:
+            fields["seller"] = seller_block
+    # si buyer vide ou label-only, on remplace
+    if (not fields.get("buyer")) or _is_label_only(fields.get("buyer")):
+        if buyer_block:
+            fields["buyer"] = buyer_block
+
+    # cas extrême : si buyer a aspiré la zone “Description …”, on purge
+    if fields.get("buyer") and _STOP_LABELS_RX.search(fields["buyer"]):
+        # garde uniquement les lignes avant le premier stop
+        chunk = []
+        for l in fields["buyer"].splitlines():
+            if _STOP_LABELS_RX.search(l):
+                break
+            chunk.append(l)
+        cleaned = "\n".join(chunk).strip()
+        if len(cleaned) >= 6:
+            fields["buyer"] = cleaned
+        else:
+            # si trop court, on considère None
+            fields["buyer"] = None
+
+
 # ---------- Heuristique “ça ressemble à une facture ?” ----------
 
 def _looks_like_invoice_text(t: str) -> bool:
@@ -157,8 +256,10 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             result["meta"]["ocr_pages"] = 0
             return result
 
+        # normalisations OCR
         txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', txt, flags=_re.I)
         txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', txt, flags=_re.I)
+        txt = _pre_clean_text(txt)
 
         result["meta"]["ocr_used"] = True
         result["meta"]["ocr_pages"] = 1
@@ -170,7 +271,9 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         result["text_preview"] = txt[:2000]
 
         _fill_fields_from_text(result, txt)
+        _fix_parties_from_labels(txt, fields)
 
+        # rattrapage montants
         if fields.get("total_ttc") is None:
             ttc = _search_amount(txt, TOTAL_TTC_NEAR_RE)
             if ttc is not None:
@@ -188,6 +291,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tva is not None:
                 fields["total_tva"] = tva
 
+        # lignes (regex fallback sur OCR)
         lines = parse_lines_regex(txt)
         if lines:
             result["lines"] = lines
@@ -212,19 +316,21 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         return result
 
     # ---------- PDF TEXTE (pdfminer) ----------
-    text = pdf_text(p) or ""
+    text_raw = pdf_text(p) or ""
+    text = _pre_clean_text(text_raw)
     result["text"] = text[:20000]
     result["text_preview"] = text[:2000]
-    result["meta"]["pages"] = (text.count("\f") + 1) if text else 0
+    result["meta"]["pages"] = (text_raw.count("\f") + 1) if text_raw else 0
 
     _fill_fields_from_text(result, text)
+    _fix_parties_from_labels(text, fields)
 
     empty_core = not any([
-        result["fields"].get("invoice_number"),
-        result["fields"].get("invoice_date"),
-        result["fields"].get("total_ht"),
-        result["fields"].get("total_tva"),
-        result["fields"].get("total_ttc"),
+        fields.get("invoice_number"),
+        fields.get("invoice_date"),
+        fields.get("total_ht"),
+        fields.get("total_tva"),
+        fields.get("total_ttc"),
     ])
     need_ocr_fallback = (len(result["text"]) < 120) or (not _looks_like_invoice_text(result["text"])) or empty_core
     ocr_used = False
@@ -238,6 +344,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         if ocr_txt:
             ocr_txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', ocr_txt, flags=_re.I)
             ocr_txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', ocr_txt, flags=_re.I)
+            ocr_txt = _pre_clean_text(ocr_txt)
 
             result["meta"]["ocr_used"] = True
             result["meta"]["ocr_pages"] = oinfo.get("ocr_pages") or 0
@@ -250,6 +357,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             ocr_used = True
 
             _fill_fields_from_text(result, text)
+            _fix_parties_from_labels(text, fields)
         else:
             if oinfo.get("error"):
                 result["meta"]["warnings"].append(
@@ -257,22 +365,22 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
                 )
 
     # Rattrapage montants (pdfminer ou OCR)
-    if result["fields"].get("total_ttc") is None:
+    if fields.get("total_ttc") is None:
         ttc = _search_amount(text, TOTAL_TTC_NEAR_RE)
         if ttc is not None:
-            result["fields"]["total_ttc"] = ttc
+            fields["total_ttc"] = ttc
 
-    if result["fields"].get("total_ht") is None:
+    if fields.get("total_ht") is None:
         ht = _search_amount(text, TOTAL_HT_NEAR_RE)
         if ht is None:
             ht = _patch_total_ht_fuzzy(text)
         if ht is not None:
-            result["fields"]["total_ht"] = ht
+            fields["total_ht"] = ht
 
-    if result["fields"].get("total_tva") in (None, 0):
+    if fields.get("total_tva") in (None, 0):
         tva = _search_amount(text, TVA_AMOUNT_NEAR_RE)
         if tva is not None:
-            result["fields"]["total_tva"] = tva
+            fields["total_tva"] = tva
 
     # Lignes
     lines: List[Dict[str, Any]] | None = None
