@@ -25,12 +25,10 @@ from .utils_amounts import approx as approx_utils
 # ---------- Helpers montant ----------
 
 def _norm_amount_str(s: str) -> str:
-    """Nettoie une chaîne montant en format décimal Python '1234.56'."""
     if not s:
         return s
     s = s.strip().replace("\u00A0", " ").replace("€", "")
-    s = s.replace(" ", "")  # supprime espaces de milliers
-    # heuristique FR -> '.' si virgule est la dernière séparation décimale
+    s = s.replace(" ", "")
     if "," in s:
         last_comma = s.rfind(",")
         last_dot = s.rfind(".")
@@ -38,7 +36,6 @@ def _norm_amount_str(s: str) -> str:
             s = s.replace(".", "")
             s = s.replace(",", ".")
     return s
-
 
 def _to_float(s: Optional[str]) -> Optional[float]:
     if not s:
@@ -48,23 +45,18 @@ def _to_float(s: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
-
 def _to_num(v) -> Optional[float]:
-    """Accepte déjà float/int ou str et renvoie float."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
         return float(v)
     return _to_float(str(v))
 
-
 def _search_amount(text: str, rx: _re.Pattern) -> Optional[float]:
-    """Cherche une regex de montant (capt groupe 1) et renvoie float si possible."""
     m = rx.search(text or "")
     if not m:
         return None
     return _to_float(m.group(1))
-
 
 def _extract_vat_rate(text: str) -> Optional[float]:
     m = VAT_RATE_RE.search(text or "")
@@ -73,23 +65,14 @@ def _extract_vat_rate(text: str) -> Optional[float]:
     vr = m.group(1)
     return 5.5 if vr in ("5,5", "5.5") else float(vr)
 
-
 def _patch_total_ht_fuzzy(text: str) -> Optional[float]:
-    """Rattrape OCR : 'Total MT' / 'Total MI' (HT mal lu)."""
     m = _re.search(
-        r'Total\s*M[TI]\s*[:\-]?\s*[^\n\r]{0,60}?([0-9][0-9\.\,\s]+)\s*€?',
+        r'Total\s*M[TI]\s*[:\-]?\s*[^\n\r]{0,80}?([0-9][0-9\.\,\s]+)\s*€?',
         text or "", _re.I
     )
     return _to_float(m.group(1)) if m else None
 
-
 def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> None:
-    """
-    Essaie de compléter HT/TVA/TTC à partir des infos présentes.
-    - Tolère total_tva == 0 comme “manquant”
-    - Utilise _infer_totals selon combinaisons disponibles
-    - Termine par TVA = TTC - HT si cohérent
-    """
     total_ht  = fields.get("total_ht")
     total_tva = fields.get("total_tva")
     total_ttc = fields.get("total_ttc")
@@ -109,7 +92,6 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
         fields["total_ttc"] = tt
         total_ttc = tt
 
-    # Dernière chance cohérente : TVA = TTC - HT si possible
     if (
         fields.get("total_tva") in (None, 0)
         and fields.get("total_ttc") is not None
@@ -123,14 +105,10 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
 # ---------- Heuristique “ça ressemble à une facture ?” ----------
 
 def _looks_like_invoice_text(t: str) -> bool:
-    """Heuristique rapide pour détecter du texte 'facture' plausible."""
     t_low = (t or "").lower()
-    markers = [
-        "facture", "invoice", "total", "tva", "montant", "pu", "qté", "ttc", "t.t.c", "€"
-    ]
+    markers = ["facture", "invoice", "total", "tva", "montant", "pu", "qté", "ttc", "t.t.c", "€"]
     if any(m in t_low for m in markers):
         return True
-    # Nombres style 1 234,56 ou 1.234,56
     if _re.search(r"\b\d{1,3}(?:[ .]\d{3})*(?:[,.]\d{2})\b", t or ""):
         return True
     return False
@@ -179,7 +157,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             result["meta"]["ocr_pages"] = 0
             return result
 
-        # Normalisations simples pour labels collés/variants
         txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', txt, flags=_re.I)
         txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', txt, flags=_re.I)
 
@@ -192,10 +169,8 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         result["text"] = txt[:20000]
         result["text_preview"] = txt[:2000]
 
-        # Champs via patterns
         _fill_fields_from_text(result, txt)
 
-        # Rattrapage montants si manquants
         if fields.get("total_ttc") is None:
             ttc = _search_amount(txt, TOTAL_TTC_NEAR_RE)
             if ttc is not None:
@@ -204,7 +179,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         if fields.get("total_ht") is None:
             ht = _search_amount(txt, TOTAL_HT_NEAR_RE)
             if ht is None:
-                ht = _patch_total_ht_fuzzy(txt)  # Total MT -> HT
+                ht = _patch_total_ht_fuzzy(txt)
             if ht is not None:
                 fields["total_ht"] = ht
 
@@ -213,7 +188,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tva is not None:
                 fields["total_tva"] = tva
 
-        # Lignes (regex fallback sur OCR)
         lines = parse_lines_regex(txt)
         if lines:
             result["lines"] = lines
@@ -232,7 +206,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             else:
                 _post_compute_totals(fields, vat_rate)
         else:
-            # Pas de lignes : tenter quand même d'inférer d'après les montants trouvés
             vat_rate = _extract_vat_rate(txt)
             _post_compute_totals(fields, vat_rate)
 
@@ -244,13 +217,8 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     result["text_preview"] = text[:2000]
     result["meta"]["pages"] = (text.count("\f") + 1) if text else 0
 
-    # On tente d’abord d’extraire les champs sur le texte pdfminer…
     _fill_fields_from_text(result, text)
 
-    # Décide si on doit basculer en OCR :
-    # - texte trop court
-    # - texte qui ne "ressemble pas" à une facture
-    # - aucun champ clé trouvé (numéro/date/HT/TVA/TTC)
     empty_core = not any([
         result["fields"].get("invoice_number"),
         result["fields"].get("invoice_date"),
@@ -259,7 +227,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         result["fields"].get("total_ttc"),
     ])
     need_ocr_fallback = (len(result["text"]) < 120) or (not _looks_like_invoice_text(result["text"])) or empty_core
-
     ocr_used = False
     if ocr in ("always", "force"):
         need_ocr_fallback = True
@@ -269,7 +236,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             p, lang="fra+eng", max_pages=5, dpi=280, timeout_per_page=30
         )
         if ocr_txt:
-            # petites normalisations utiles
             ocr_txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', ocr_txt, flags=_re.I)
             ocr_txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', ocr_txt, flags=_re.I)
 
@@ -278,21 +244,19 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if oinfo.get("warnings"):
                 result["meta"]["warnings"] += oinfo["warnings"]
 
-            text = ocr_txt  # -> on bascule le pipeline sur l’OCR
+            text = ocr_txt
             result["text"] = text[:20000]
             result["text_preview"] = text[:2000]
             ocr_used = True
 
-            # re-parse des champs sur le texte OCR
             _fill_fields_from_text(result, text)
         else:
-            # OCR a essayé mais rien d’exploitable
             if oinfo.get("error"):
                 result["meta"]["warnings"].append(
                     f"pdf_ocr:{oinfo.get('error')}:{oinfo.get('details','')}".strip()
                 )
 
-    # --- Rattrapage montants si manquants (marche pour pdfminer OU OCR) ---
+    # Rattrapage montants (pdfminer ou OCR)
     if result["fields"].get("total_ttc") is None:
         ttc = _search_amount(text, TOTAL_TTC_NEAR_RE)
         if ttc is not None:
@@ -310,11 +274,10 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         if tva is not None:
             result["fields"]["total_tva"] = tva
 
-    # --- Lignes : déterminer la stratégie réellement utilisée ---
+    # Lignes
     lines: List[Dict[str, Any]] | None = None
 
     if not ocr_used:
-        # On tente les stratégies 'xpos' / 'table' sur le PDF original uniquement
         lx = parse_lines_by_xpos(str(p))
         if lx:
             lines = lx
@@ -325,14 +288,12 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
                 lines = lt
                 result["meta"]["line_strategy"] = "table"
 
-    # Si toujours rien, tente une regex sur le texte courant (pdfminer ou OCR)
     if not lines:
         lr = parse_lines_regex(text)
         if lr:
             lines = lr
             result["meta"]["line_strategy"] = "regex"
 
-    # --- Totaux à partir des lignes (si présentes) ---
     if lines:
         result["lines"] = lines
         fields["lines_count"] = len(lines)
@@ -349,7 +310,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         else:
             _post_compute_totals(fields, vat_rate)
     else:
-        # Pas de lignes -> tenter quand même d’inférer les totaux
         vat_rate = _extract_vat_rate(text)
         _post_compute_totals(fields, vat_rate)
 
