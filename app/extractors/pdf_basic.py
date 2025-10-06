@@ -152,7 +152,6 @@ def _block_after_label(lines: List[str], label_idx: int, max_lines: int = 5) -> 
 def _fix_parties_from_labels(text: str, fields: Dict[str, Any]) -> None:
     """Si seller/buyer manquants ou suspects, tente une extraction par proximité de labels."""
     lines = [l for l in (text or "").splitlines()]
-    # indices des labels
     seller_block = None
     buyer_block  = None
 
@@ -176,18 +175,14 @@ def _fix_parties_from_labels(text: str, fields: Dict[str, Any]) -> None:
         s = x.strip().lower()
         return s in ("destinataire:", "émetteur:", "emetteur:", "seller:", "buyer:", "client:", "acheteur:")
 
-    # si seller vide ou label-only, on remplace
     if (not fields.get("seller")) or _is_label_only(fields.get("seller")):
         if seller_block:
             fields["seller"] = seller_block
-    # si buyer vide ou label-only, on remplace
     if (not fields.get("buyer")) or _is_label_only(fields.get("buyer")):
         if buyer_block:
             fields["buyer"] = buyer_block
 
-    # cas extrême : si buyer a aspiré la zone “Description …”, on purge
     if fields.get("buyer") and _STOP_LABELS_RX.search(fields["buyer"]):
-        # garde uniquement les lignes avant le premier stop
         chunk = []
         for l in fields["buyer"].splitlines():
             if _STOP_LABELS_RX.search(l):
@@ -197,7 +192,6 @@ def _fix_parties_from_labels(text: str, fields: Dict[str, Any]) -> None:
         if len(cleaned) >= 6:
             fields["buyer"] = cleaned
         else:
-            # si trop court, on considère None
             fields["buyer"] = None
 
 
@@ -313,6 +307,8 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             vat_rate = _extract_vat_rate(txt)
             _post_compute_totals(fields, vat_rate)
 
+        # hint parties
+        (result["meta"].setdefault("hints", {}))["parties_strategy"] = "ocr_blocks_labels"
         return result
 
     # ---------- PDF TEXTE (pdfminer) ----------
@@ -358,6 +354,8 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
 
             _fill_fields_from_text(result, text)
             _fix_parties_from_labels(text, fields)
+
+            (result["meta"].setdefault("hints", {}))["ocr_trigger"] = "short_or_unconvincing_or_empty_core"
         else:
             if oinfo.get("error"):
                 result["meta"]["warnings"].append(
@@ -420,5 +418,14 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     else:
         vat_rate = _extract_vat_rate(text)
         _post_compute_totals(fields, vat_rate)
+
+    # hint parties (quel chemin a permis d'avoir des parties)
+    (result["meta"].setdefault("hints", {}))["parties_strategy"] = (
+        "blocks"
+        if (fields.get("seller") and fields.get("buyer"))
+        else "labels"
+        if (fields.get("seller") or fields.get("buyer"))
+        else "header_fallback"
+    )
 
     return result
