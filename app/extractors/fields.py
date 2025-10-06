@@ -9,7 +9,7 @@ from .patterns import (
 )
 from .utils_amounts import _norm_amount, _clean_block
 
-# --- Petites normalisations OCR utiles ---
+# ---------- Normalisations OCR utiles ----------
 _OCR_SPACES_FIX = [
     ("\u00A0", " "),  # NBSP
     ("  ", " "),
@@ -24,20 +24,85 @@ def _normalize_ocr_text(t: str) -> str:
         t = t.replace(a, b)
     return t
 
+# ---------- Garde-fous pour blocs parties ----------
+STOP_WORDS_RX = re.compile(
+    r'\b('
+    r'Description|Désignation|Designations?|Items?|Lines?|'
+    r'Prix\s*Unitaire|Unit\s*Price|Quantité|Qty|Montant|Amount|'
+    r'Total(?:\s*HT|\s*TTC)?|Subtotal|Grand\s*total|TVA|VAT|'
+    r'R[èe]glement|Payment|Conditions?|Terms|'
+    r'file://|https?://'
+    r')\b', re.I
+)
+HEADER_NOISE_RX = re.compile(r'^\s*(FACTURE|INVOICE)\b', re.I)
+DATE_LINE_RX    = re.compile(r'^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2})?\s*$')
+ALL_NUMERIC_RX  = re.compile(r'^[\d\s./:-]+$')
+
+def _clip_at_stoppers(block: str) -> str:
+    """Coupe un bloc avant mots-clés de table/totaux et à la 1re double-ligne."""
+    if not block:
+        return ""
+    para = block.split("\n\n", 1)[0]
+    m = STOP_WORDS_RX.search(para)
+    if m:
+        para = para[:m.start()]
+    return para.strip()
+
+def _sanitize_party_block(block: str, max_lines: int = 6, min_len: int = 5) -> str:
+    """Nettoie un bloc Partie: retire lignes vides/bruit, limite la taille, rejette faux positifs."""
+    if not block:
+        return ""
+    lines = [l.strip() for l in block.splitlines()]
+    out = []
+    for l in lines:
+        if not l:
+            break  # s’arrête au premier saut de paragraphe
+        if HEADER_NOISE_RX.match(l):  # “FACTURE”, “INVOICE”
+            continue
+        if DATE_LINE_RX.match(l):     # ligne qui n’est qu’une date
+            continue
+        if ALL_NUMERIC_RX.match(l):   # lignes quasi numériques
+            continue
+        out.append(l)
+        if len(out) >= max_lines:
+            break
+    s = "\n".join(out).strip()
+    if len(s) < min_len:
+        return ""
+    return s
+
+def _extract_after_label(text: str, labels: list[str]) -> str:
+    """
+    Lit juste après le label (ex: 'ÉMETTEUR:') et renvoie un petit bloc (nom+adresse) nettoyé.
+    On coupe très tôt pour ne pas avaler la table.
+    """
+    t = text or ""
+    for lab in labels:
+        m = re.search(rf'(?:^|\n)\s*{lab}\s*:?\s*(.*)', t, re.I)
+        if not m:
+            continue
+        tail = m.group(1)
+        tail = "\n".join(tail.splitlines()[:10])  # garde ~10 lignes max
+        tail = _clip_at_stoppers(tail)
+        tail = _sanitize_party_block(tail)
+        if tail:
+            return tail
+    return ""
 
 def _first_nonempty_lines(block: str, max_lines: int = 5) -> str:
-    """Garde les 3–5 premières lignes non vides d’un bloc pour éviter de capturer trop."""
+    """Garde les premières lignes non vides d’un bloc pour éviter de capturer trop."""
     if not block:
-        return block
-    lines = [l.strip() for l in block.splitlines()]
-    lines = [l for l in lines if l]
+        return ""
+    lines = [l.strip() for l in block.splitlines() if l.strip()]
     return "\n".join(lines[:max_lines]).strip()
-
 
 def _extract_parties_from_text(text: str) -> tuple[str | None, str | None]:
     """
-    Essaie plusieurs patterns pour seller/buyer.
-    Renvoie (seller, buyer) éventuellement None si non trouvés.
+    (seller, buyer) par ordre:
+      1) blocs regex (SELLER_BLOCK/CLIENT_BLOCK…)
+      2) fallback ancré (après labels)
+      3) heuristique tête de document pour seller
+    Le tout avec clipping/sanitizing pour éviter d’avaler la table.
     """
     seller = None
     buyer  = None
@@ -45,43 +110,44 @@ def _extract_parties_from_text(text: str) -> tuple[str | None, str | None]:
     # 1) Blocs explicites
     m = SELLER_BLOCK.search(text or "") or EMETTEUR_BLOCK.search(text or "")
     if m:
-        seller = _first_nonempty_lines(_clean_block(m.group("blk")))
-
+        seller = _sanitize_party_block(_clip_at_stoppers(_clean_block(m.group("blk"))))
     m = CLIENT_BLOCK.search(text or "") or DESTINATAIRE_BLOCK.search(text or "")
     if m:
-        buyer = _first_nonempty_lines(_clean_block(m.group("blk")))
+        buyer = _sanitize_party_block(_clip_at_stoppers(_clean_block(m.group("blk"))))
 
-    # 2) Si labels absents, heuristique simple : top du document vs zone "Client"
+    # 2) Fallback ancré si manquant ou contaminé par des stop-words
+    if not seller or STOP_WORDS_RX.search(seller or ""):
+        s = _extract_after_label(text, ["ÉMETTEUR", "EMETTEUR", "Seller", "From", "Issuer", "Entreprise", "Company"])
+        if s:
+            seller = s
+    if not buyer or STOP_WORDS_RX.search(buyer or ""):
+        b = _extract_after_label(text, ["DESTINATAIRE", "Client", "Buyer", "Bill\s*to", "Invoice\s*to", "Ship\s*to"])
+        if b:
+            buyer = b
+
+    # 3) Heuristique tête de document pour seller (si toujours vide)
     if not seller:
-        # haut de page (premières 15 lignes), souvent l'émetteur
         head = "\n".join((text or "").splitlines()[:15])
-        # on évite les métadonnées type "file://"
         head = re.sub(r"file://[^\n]+", "", head, flags=re.I)
-        # On coupe à la première double-ligne pour éviter de tout avaler
-        head = head.split("\n\n")[0]
-        head = _clean_block(head)
-        if head and len(head) > 8:
-            seller = _first_nonempty_lines(head, max_lines=6)
-
-    if not buyer:
-        # heuristique: chercher "Client" ou "Buyer" + bloc suivant
-        m = re.search(r'(?:^|\n)\s*(Client|Buyer)\s*:?\s*(.+?)(?:\n{2,}|\Z)', text or "", re.I | re.S)
-        if m:
-            buyer = _first_nonempty_lines(_clean_block(m.group(2)), max_lines=6)
+        head = _clip_at_stoppers(_clean_block(head.split("\n\n")[0]))
+        head = _sanitize_party_block(head, max_lines=6)
+        if head:
+            seller = head
 
     return (seller or None), (buyer or None)
 
+# ---------- Remplissage principal ----------
 
 def _fill_fields_from_text(result: dict, text: str) -> None:
     text = _normalize_ocr_text(text or "")
     fields = result["fields"]
 
-    # ---- Numéro facture
+    # Numéro facture
     m_num = FACTURE_NO_RE.search(text) or INVOICE_NUM_RE.search(text) or NUM_RE.search(text)
     if m_num:
         fields["invoice_number"] = m_num.group(1).strip()
 
-    # ---- Date
+    # Date
     m_date = DATE_RE.search(text)
     if m_date:
         try:
@@ -91,17 +157,15 @@ def _fill_fields_from_text(result: dict, text: str) -> None:
         except Exception:
             fields.setdefault("invoice_date", None)
 
-    # ---- Totaux
+    # Totaux
     total_ttc = None
     near = TOTAL_TTC_NEAR_RE.findall(text)
     if near:
         total_ttc = _norm_amount(near[-1])
-
     if total_ttc is None:
         m_strict = EUR_STRICT_RE.findall(text)
         if m_strict:
             total_ttc = _norm_amount(m_strict[-1])
-
     if total_ttc is not None:
         fields["total_ttc"] = total_ttc
 
@@ -117,13 +181,13 @@ def _fill_fields_from_text(result: dict, text: str) -> None:
         if tva_val is not None:
             fields["total_tva"] = tva_val
 
-    # ---- Currency
+    # Currency
     if re.search(r"\bEUR\b|€", text, re.I): fields["currency"] = "EUR"
     elif re.search(r"\bGBP\b|£", text, re.I): fields["currency"] = "GBP"
     elif re.search(r"\bCHF\b", text, re.I): fields["currency"] = "CHF"
     elif re.search(r"\bUSD\b|\$", text, re.I): fields["currency"] = "USD"
 
-    # ---- Parties (seller/buyer)
+    # Parties (seller/buyer)
     if not fields.get("seller") or not fields.get("buyer"):
         s, b = _extract_parties_from_text(text)
         if s and not fields.get("seller"):
@@ -131,7 +195,7 @@ def _fill_fields_from_text(result: dict, text: str) -> None:
         if b and not fields.get("buyer"):
             fields["buyer"] = b
 
-    # ---- IDs FR (dans l’ordre de priorité)
+    # IDs FR
     if not fields.get("seller_tva"):
         m = TVA_RE.search(text)
         if m: fields["seller_tva"] = m.group(0).replace(" ", "")
