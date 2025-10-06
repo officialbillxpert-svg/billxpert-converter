@@ -1,3 +1,4 @@
+# app/extractors/fields.py
 from __future__ import annotations
 import re
 
@@ -38,6 +39,13 @@ HEADER_NOISE_RX = re.compile(r'^\s*(FACTURE|INVOICE)\b', re.I)
 DATE_LINE_RX    = re.compile(r'^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2})?\s*$')
 ALL_NUMERIC_RX  = re.compile(r'^[\d\s./:-]+$')
 
+LABEL_ONLY_RX = re.compile(
+    r'^\s*(?:émetteur|emetteur|seller|from|issuer|destinataire|client|acheteur|buyer)\s*:?\s*$',
+    re.I
+)
+def _is_label_only(s: str | None) -> bool:
+    return bool(s) and bool(LABEL_ONLY_RX.match(s.strip()))
+
 def _clip_at_stoppers(block: str) -> str:
     """Coupe un bloc avant mots-clés de table/totaux et à la 1re double-ligne."""
     if not block:
@@ -74,7 +82,8 @@ def _sanitize_party_block(block: str, max_lines: int = 6, min_len: int = 5) -> s
 def _extract_after_label(text: str, labels: list[str]) -> str:
     """
     Lit juste après le label (ex: 'ÉMETTEUR:') et renvoie un petit bloc (nom+adresse) nettoyé.
-    On coupe très tôt pour ne pas avaler la table.
+    - coupe dès qu'on voit table/totaux/autre label
+    - rejette les "label-only" et les blocs trop courts
     """
     t = text or ""
     for lab in labels:
@@ -82,11 +91,16 @@ def _extract_after_label(text: str, labels: list[str]) -> str:
         if not m:
             continue
         tail = m.group(1)
-        tail = "\n".join(tail.splitlines()[:10])  # garde ~10 lignes max
+        # garde très peu de lignes: on évite d’aspirer la table
+        tail = "\n".join(tail.splitlines()[:8])
         tail = _clip_at_stoppers(tail)
         tail = _sanitize_party_block(tail)
-        if tail:
-            return tail
+        if not tail or _is_label_only(tail):
+            continue
+        first_line = tail.splitlines()[0].strip() if tail else ""
+        if _is_label_only(first_line):
+            continue
+        return tail
     return ""
 
 def _first_nonempty_lines(block: str, max_lines: int = 5) -> str:
@@ -116,25 +130,33 @@ def _extract_parties_from_text(text: str) -> tuple[str | None, str | None]:
         buyer = _sanitize_party_block(_clip_at_stoppers(_clean_block(m.group("blk"))))
 
     # 2) Fallback ancré si manquant ou contaminé par des stop-words
-    if not seller or STOP_WORDS_RX.search(seller or ""):
+    if not seller or STOP_WORDS_RX.search(seller or "") or _is_label_only(seller):
         s = _extract_after_label(text, ["ÉMETTEUR", "EMETTEUR", "Seller", "From", "Issuer", "Entreprise", "Company"])
         if s:
             seller = s
-    if not buyer or STOP_WORDS_RX.search(buyer or ""):
-        b = _extract_after_label(text, ["DESTINATAIRE", "Client", "Buyer", "Bill\s*to", "Invoice\s*to", "Ship\s*to"])
+    if not buyer or STOP_WORDS_RX.search(buyer or "") or _is_label_only(buyer):
+        b = _extract_after_label(text, ["DESTINATAIRE", "Client", "Buyer", r"Bill\s*to", r"Invoice\s*to", r"Ship\s*to"])
         if b:
             buyer = b
 
     # 3) Heuristique tête de document pour seller (si toujours vide)
-    if not seller:
+    if not seller or _is_label_only(seller):
         head = "\n".join((text or "").splitlines()[:15])
         head = re.sub(r"file://[^\n]+", "", head, flags=re.I)
         head = _clip_at_stoppers(_clean_block(head.split("\n\n")[0]))
         head = _sanitize_party_block(head, max_lines=6)
-        if head:
+        if head and not _is_label_only(head):
             seller = head
 
-    return (seller or None), (buyer or None)
+    # Nettoyage final : rejeter label-only / blocs contaminés
+    if seller and (_is_label_only(seller) or STOP_WORDS_RX.search(seller)):
+        seller = ""
+    if buyer and (_is_label_only(buyer) or STOP_WORDS_RX.search(buyer)):
+        buyer = ""
+
+    seller = seller or None
+    buyer  = buyer  or None
+    return seller, buyer
 
 # ---------- Remplissage principal ----------
 
@@ -188,11 +210,12 @@ def _fill_fields_from_text(result: dict, text: str) -> None:
     elif re.search(r"\bUSD\b|\$", text, re.I): fields["currency"] = "USD"
 
     # Parties (seller/buyer)
-    if not fields.get("seller") or not fields.get("buyer"):
-        s, b = _extract_parties_from_text(text)
-        if s and not fields.get("seller"):
+    s, b = _extract_parties_from_text(text)
+    if not fields.get("seller") or _is_label_only(fields.get("seller")):
+        if s and not _is_label_only(s):
             fields["seller"] = s
-        if b and not fields.get("buyer"):
+    if not fields.get("buyer") or _is_label_only(fields.get("buyer")):
+        if b and not _is_label_only(b):
             fields["buyer"] = b
 
     # IDs FR
