@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 
 # ---------- Version ----------
-PATTERNS_VERSION = "v2025-10-03g"
+PATTERNS_VERSION = "v2025-10-04a"
 
 # ---------- Numéro / Date ----------
 FACTURE_NO_RE = re.compile(
@@ -19,12 +19,12 @@ DATE_RE = re.compile(
 # ---------- Totaux ----------
 # Plus tolérant aux confusions OCR ("Total MT", "TTC" variés, espaces, etc.)
 TOTAL_TTC_NEAR_RE = re.compile(
-    r'(?:Total\s*(?:T[TC]C?|TT[C€]|Grand\s*total|Total\s*amount|Total\s*à\s*payer))\s*[:\-]?\s*[^\n\r]{0,60}?'
+    r'(?:Total\s*(?:T[TC]C?|TT[C€]|Grand\s*total|Total\s*amount|Total\s*à\s*payer))\s*[:\-]?\s*[^\n\r]{0,80}?'
     r'([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
 TOTAL_HT_NEAR_RE = re.compile(
-    r'Total\s*[HNM][T1]\s*[:\-]?\s*[^\n\r]{0,60}?([0-9][0-9\.\,\s]+)\s*€?',
+    r'Total\s*[HNM][T1]\s*[:\-]?\s*[^\n\r]{0,80}?([0-9][0-9\.\,\s]+)\s*€?',
     re.I
 )
 
@@ -47,20 +47,25 @@ TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
 IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
 
 # ---------- Blocs parties ----------
+# On ajoute plus de libellés possibles (FR/EN) + tolérance OCR
 SELLER_BLOCK = re.compile(
-    r'(?:Émetteur|Emetteur|Vendeur|Seller)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Client|Acheteur|Buyer|Destinataire|DESTINATAIRE)',
+    r'(?:^|\n)\s*(?:Émetteur|Emetteur|Vendeur|Venteur|Seller|From|Issuer|Soci[ée]t[ée]|Entreprise|Company)\s*:?\s*'
+    r'(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:Client|Acheteur|Buyer|Destinataire|DESTINATAIRE|Bill\s*to|Invoice\s*to)\b)|\Z)',
     re.I | re.S
 )
 CLIENT_BLOCK = re.compile(
-    r'(?:Client|Acheteur|Buyer)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|Émetteur|Emetteur|Vendeur|Seller)',
+    r'(?:^|\n)\s*(?:Client|Cliente|Acheteur|Buyer|Bill\s*to|Invoice\s*to|Destinataire|DESTINATAIRE|Ship\s*to)\s*:?\s*'
+    r'(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:Émetteur|Emetteur|Vendeur|Seller|From|Issuer|Soci[ée]t[ée])\b)|\Z)',
     re.I | re.S
 )
+
+# Cas où les titres sont typés fort (majuscules)
 EMETTEUR_BLOCK = re.compile(
-    r'(?:^|\n)\s*(?:ÉMETTEUR|EMETTEUR)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|DESTINATAIRE|Client|Acheteur|Buyer)',
+    r'(?:^|\n)\s*(?:ÉMETTEUR|EMETTEUR)\s*:?\s*(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:DESTINATAIRE|Client|Acheteur|Buyer|Bill\s*to)\b)|\Z)',
     re.I | re.S
 )
 DESTINATAIRE_BLOCK = re.compile(
-    r'(?:^|\n)\s*(?:DESTINATAIRE)\s*:?\s*(?P<blk>.+?)(?:\n{2,}|ÉMETTEUR|EMETTEUR|Seller|Vendeur)',
+    r'(?:^|\n)\s*(?:DESTINATAIRE)\s*:?\s*(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:ÉMETTEUR|EMETTEUR|Seller|Vendeur|From|Issuer)\b)|\Z)',
     re.I | re.S
 )
 
