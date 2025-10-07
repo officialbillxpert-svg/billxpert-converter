@@ -41,6 +41,16 @@ def _save_upload_to_tmp() -> Path:
     if not f or not f.filename:
         raise ValueError("no_file")
 
+    # Vérifie que le flux n'est pas vide
+    try:
+        f.stream.seek(0, io.SEEK_END)
+        size = f.stream.tell()
+        f.stream.seek(0)
+    except Exception:
+        size = None
+    if size == 0:
+        raise ValueError("empty_file")
+
     filename = secure_filename(f.filename)
     ext = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTS:
@@ -54,9 +64,32 @@ def _save_upload_to_tmp() -> Path:
 
 
 # ---------- Routes ----------
+@app.get("/")
+def index():
+    return jsonify({
+        "ok": True,
+        "service": "billxpert-converter",
+        "endpoints": ["/healthz", "/check-libs", "/diag", "/api/convert", "/api/summary", "/api/summary.csv", "/api/lines", "/api/lines.csv"]
+    }), 200
+
+
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
+
+@app.get("/check-libs")
+def check_libs():
+    import importlib
+    libs = ["pdfminer", "pdfplumber", "pypdfium2", "PIL", "pytesseract", "dateutil"]
+    result = {}
+    for lib in libs:
+        try:
+            importlib.import_module(lib)
+            result[lib] = "✅ OK"
+        except Exception as e:
+            result[lib] = f"❌ {type(e).__name__}: {e}"
+    return jsonify(result), 200
 
 
 @app.get("/diag")
@@ -66,7 +99,6 @@ def diag():
         import pytesseract
         pt_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
     except Exception:
-        pytesseract = None  # noqa: F841
         pt_cmd = None
 
     which = shutil.which("tesseract")
