@@ -1,14 +1,22 @@
 Flask==3.0.3
 flask-cors==4.0.1
 gunicorn==22.0.0
+
+# --- PDF / OCR ---
 pdfminer.six==20231228
 pdfplumber==0.11.5
 pikepdf==9.4.2
 pypdfium2==4.30.0
 Pillow==11.3.0
 pytesseract==0.3.10
-python-dateutil==2.9.0.post0
 opencv-python-headless==4.10.0.84
-# Optional handwriting (heavy):
+python-dateutil==2.9.0.post0
+
+# --- AI helpers / Intelligence légère ---
+rapidfuzz==3.9.3
+scikit-learn==1.5.2
+dateparser==1.2.0
+
+# --- Optional handwriting (heavy, disable for now) ---
 # paddleocr==2.7.0.3
 # shapely==2.0.4
