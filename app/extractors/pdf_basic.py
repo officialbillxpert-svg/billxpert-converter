@@ -1,4 +1,6 @@
+# app/extractors/pdf_basic.py
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import re as _re
@@ -20,8 +22,8 @@ from .lines_parsers import (
 )
 from .utils_amounts import approx as approx_utils
 
-# ---------- Helpers montant ----------
 
+# ---------- Helpers montant ----------
 def _norm_amount_str(s: str) -> str:
     if not s:
         return s
@@ -35,6 +37,7 @@ def _norm_amount_str(s: str) -> str:
             s = s.replace(",", ".")
     return s
 
+
 def _to_float(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
@@ -43,6 +46,7 @@ def _to_float(s: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
+
 def _to_num(v) -> Optional[float]:
     if v is None:
         return None
@@ -50,11 +54,13 @@ def _to_num(v) -> Optional[float]:
         return float(v)
     return _to_float(str(v))
 
+
 def _search_amount(text: str, rx: _re.Pattern) -> Optional[float]:
     m = rx.search(text or "")
     if not m:
         return None
     return _to_float(m.group(1))
+
 
 def _extract_vat_rate(text: str) -> Optional[float]:
     m = VAT_RATE_RE.search(text or "")
@@ -63,15 +69,19 @@ def _extract_vat_rate(text: str) -> Optional[float]:
     vr = m.group(1)
     return 5.5 if vr in ("5,5", "5.5") else float(vr)
 
+
 def _patch_total_ht_fuzzy(text: str) -> Optional[float]:
+    # Un peu plus tolérant aux confusions OCR : "Tota1", "MT", etc.
     m = _re.search(
         r'Tota[l1]\s*M[TI7]\s*[:\-]?\s*[^\n\r]{0,80}?([0-9][0-9\.\,\s]+)\s*€?',
-        text or "", _re.I
+        text or "",
+        _re.I,
     )
     return _to_float(m.group(1)) if m else None
 
+
 def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> None:
-    total_ht  = fields.get("total_ht")
+    total_ht = fields.get("total_ht")
     total_tva = fields.get("total_tva")
     total_ttc = fields.get("total_ttc")
 
@@ -87,32 +97,41 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
     if tt is not None:
         fields["total_ttc"] = tt
 
+    # Si HT & TTC présents mais pas la TVA, calcule la diff
     if (
         fields.get("total_tva") in (None, 0)
         and fields.get("total_ttc") is not None
-        and fields.get("total_ht")  is not None
+        and fields.get("total_ht") is not None
     ):
         diff = round(fields["total_ttc"] - fields["total_ht"], 2)
         if 0 <= diff <= 2_000_000:
             fields["total_tva"] = diff
 
-# ---------- Nettoyage ----------
 
-_META_NOISE_RX = _re.compile(r"^file://|capture d['’]écran|^\s*\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}", _re.I)
+# ---------- Nettoyage ----------
+_META_NOISE_RX = _re.compile(
+    r"^file://|capture d['’]écran|^\s*\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}",
+    _re.I,
+)
+
 
 def _pre_clean_text(t: str) -> str:
-    """# FIX: nettoie sans supprimer les vraies lignes OCR"""
+    """
+    Nettoie sans supprimer les vraies lignes OCR (tolère “Facture/Invoice”).
+    """
     if not t:
         return t
     out = []
     for line in (t or "").splitlines():
-        if _META_NOISE_RX.search(line or "") and not _re.search(r"facture|invoice", line, _re.I):
+        if _META_NOISE_RX.search(line or "") and not _re.search(
+            r"facture|invoice", line, _re.I
+        ):
             continue
         out.append(line.replace("\u00A0", " ").strip())
     return "\n".join(out)
 
-# ---------- Détection facture ----------
 
+# ---------- Heuristique “ça ressemble à une facture ?” ----------
 def _looks_like_invoice_text(t: str) -> bool:
     t_low = (t or "").lower()
     markers = ["facture", "invoice", "total", "tva", "montant", "pu", "qté", "ttc", "t.t.c", "€"]
@@ -122,8 +141,8 @@ def _looks_like_invoice_text(t: str) -> bool:
         return True
     return False
 
-# ---------- Extraction principale ----------
 
+# ---------- Extraction principale ----------
 def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     p = Path(path)
     ext = p.suffix.lower()
@@ -143,18 +162,18 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         },
         "fields": {
             "invoice_number": None,
-            "invoice_date":   None,
-            "total_ht":  None,
+            "invoice_date": None,
+            "total_ht": None,
             "total_tva": None,
             "total_ttc": None,
-            "currency":  "EUR",
+            "currency": "EUR",
         },
         "text": "",
         "text_preview": "",
     }
     fields = result["fields"]
 
-    # ---------- IMAGE ----------
+    # ---------- IMAGES (PNG/JPG) ----------
     if ext in {".png", ".jpg", ".jpeg"}:
         txt, info = ocr_image_to_text(p, lang="fra+eng")
         if info.get("error"):
@@ -164,30 +183,42 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             return result
 
         txt = _pre_clean_text(txt)
+
         result["meta"]["ocr_used"] = True
         result["meta"]["ocr_pages"] = 1
+        if "ocr_lang" in info:
+            result["meta"]["ocr_lang"] = info["ocr_lang"]
+        if "warnings" in info:
+            result["meta"]["warnings"] += info.get("warnings", [])
+
         result["text"] = txt[:20000]
         result["text_preview"] = txt[:2000]
+
         _fill_fields_from_text(result, txt)
         return result
 
-    # ---------- PDF ----------
+    # ---------- PDF (texte natif) ----------
     text_raw = pdf_text(p) or ""
     text = _pre_clean_text(text_raw)
+
     result["text"] = text[:20000]
+    result["text_preview"] = text[:2000]
     result["meta"]["pages"] = (text_raw.count("\f") + 1) if text_raw else 0
+
     _fill_fields_from_text(result, text)
 
-    empty_core = not any([
-        fields.get("invoice_number"),
-        fields.get("invoice_date"),
-        fields.get("total_ht"),
-        fields.get("total_tva"),
-        fields.get("total_ttc"),
-    ])
+    empty_core = not any(
+        [
+            fields.get("invoice_number"),
+            fields.get("invoice_date"),
+            fields.get("total_ht"),
+            fields.get("total_tva"),
+            fields.get("total_ttc"),
+        ]
+    )
 
-    # FIX: déclencheur OCR plus tolérant
-    if "capture d'écran" in text.lower() or "file://" in text.lower():
+    # Déclencheur OCR plus tolérant
+    if "capture d'écran" in (text or "").lower() or "file://" in (text or "").lower():
         text = ""
         need_ocr_fallback = True
     else:
@@ -196,28 +227,42 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     if ocr in ("always", "force"):
         need_ocr_fallback = True
 
+    # ---------- PDF (OCR fallback) ----------
     if need_ocr_fallback:
         ocr_txt, oinfo = pdf_ocr_text(
             p, lang="fra+eng", max_pages=5, dpi=280, timeout_per_page=30
         )
         if ocr_txt:
             ocr_txt = _pre_clean_text(ocr_txt)
+
             result["meta"]["ocr_used"] = True
             result["meta"]["ocr_pages"] = oinfo.get("ocr_pages") or 0
+            if oinfo.get("warnings"):
+                result["meta"]["warnings"] += oinfo.get("warnings", [])
+
             text = ocr_txt
             result["text"] = text[:20000]
-            _fill_fields_from_text(result, text)
-        elif oinfo.get("error"):
-            result["meta"]["warnings"].append(f"pdf_ocr:{oinfo.get('error')}:{oinfo.get('details','')}")
+            result["text_preview"] = text[:2000]
 
-    # Montants manquants
+            _fill_fields_from_text(result, text)
+            (result["meta"].setdefault("hints", {}))["ocr_trigger"] = (
+                "short_or_unconvincing_or_empty_core"
+            )
+        elif oinfo.get("error"):
+            result["meta"]["warnings"].append(
+                f"pdf_ocr:{oinfo.get('error')}:{oinfo.get('details','')}".strip()
+            )
+
+    # ---------- Rattrapage montants (après pdfminer ou OCR) ----------
     if fields.get("total_ttc") is None:
         ttc = _search_amount(text, TOTAL_TTC_NEAR_RE)
         if ttc is not None:
             fields["total_ttc"] = ttc
 
     if fields.get("total_ht") is None:
-        ht = _search_amount(text, TOTAL_HT_NEAR_RE) or _patch_total_ht_fuzzy(text)
+        ht = _search_amount(text, TOTAL_HT_NEAR_RE)
+        if ht is None:
+            ht = _patch_total_ht_fuzzy(text)
         if ht is not None:
             fields["total_ht"] = ht
 
@@ -225,5 +270,57 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         tva = _search_amount(text, TVA_AMOUNT_NEAR_RE)
         if tva is not None:
             fields["total_tva"] = tva
+
+    # ---------- Lignes (essayez XPOS/table si pas d’OCR, puis regex) ----------
+    lines: List[Dict[str, Any]] | None = None
+
+    # si OCR non utilisé, on tente l’extraction structurée
+    if not result["meta"]["ocr_used"]:
+        lx = parse_lines_by_xpos(str(p))
+        if lx:
+            lines = lx
+            result["meta"]["line_strategy"] = "xpos"
+        else:
+            lt = parse_lines_extract_table(str(p))
+            if lt:
+                lines = lt
+                result["meta"]["line_strategy"] = "table"
+
+    # sinon, fallback regex sur n’importe quel texte (pdfminer ou OCR)
+    if not lines:
+        lr = parse_lines_regex(text)
+        if lr:
+            lines = lr
+            result["meta"]["line_strategy"] = "regex"
+
+    if lines:
+        result["lines"] = lines
+        fields["lines_count"] = len(lines)
+
+        vat_rate = _extract_vat_rate(text)
+        total_ttc = fields.get("total_ttc")
+        sum_lines = round(sum((_to_num(r.get("amount")) or 0.0) for r in lines), 2)
+
+        if total_ttc and sum_lines and approx_utils(sum_lines, total_ttc, tol=1.5):
+            th, tv, tt = _infer_totals(total_ttc, None, None, vat_rate)
+            if th is not None:
+                fields["total_ht"] = th
+            if tv is not None:
+                fields["total_tva"] = tv
+            fields["total_ttc"] = tt or total_ttc
+        else:
+            _post_compute_totals(fields, vat_rate)
+    else:
+        vat_rate = _extract_vat_rate(text)
+        _post_compute_totals(fields, vat_rate)
+
+    # hint parties (quel chemin a donné des parties)
+    (result["meta"].setdefault("hints", {}))["parties_strategy"] = (
+        "blocks"
+        if (fields.get("seller") and fields.get("buyer"))
+        else "labels"
+        if (fields.get("seller") or fields.get("buyer"))
+        else "header_fallback"
+    )
 
     return result
