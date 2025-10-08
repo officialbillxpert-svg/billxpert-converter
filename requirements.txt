@@ -12,11 +12,11 @@ pytesseract==0.3.10
 opencv-python-headless==4.10.0.84
 python-dateutil==2.9.0.post0
 
-# --- AI helpers / Intelligence légère ---
+# --- Aides "IA" légères (fuzzy match, etc.) ---
 rapidfuzz==3.9.3
 scikit-learn==1.5.2
 dateparser==1.2.0
 
-# --- Optional handwriting (heavy, disable for now) ---
+# --- Optionnel (écriture manuscrite, lourd) ---
 # paddleocr==2.7.0.3
 # shapely==2.0.4
