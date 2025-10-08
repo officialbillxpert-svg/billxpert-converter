@@ -21,9 +21,7 @@ from .lines_parsers import (
 )
 from .utils_amounts import approx as approx_utils
 
-
 # ---------- Helpers montant ----------
-
 def _norm_amount_str(s: str) -> str:
     if not s:
         return s
@@ -101,9 +99,7 @@ def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> N
         if 0 <= diff <= 2_000_000:
             fields["total_tva"] = diff
 
-
-# ---------- Nettoyage et extraction parties (seller/buyer) ----------
-
+# ---------- Nettoyage/parties ----------
 _META_NOISE_RX = _re.compile(r"^file://|capture d['’]écran|^\s*\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}", _re.I)
 _STOP_LABELS_RX = _re.compile(
     r"(?:^|\b)(Description|Désignation|Prix|Unitaire|PU|Qté|Montant|TOTAL|TTC|TVA|RÈGLEMENT|REMIS|IBAN|Conditions?)\b",
@@ -113,7 +109,6 @@ _SELLER_LABEL_RX = _re.compile(r"(?:^|\s)(?:ÉMETTEUR|EMETTEUR|Émetteur|Emetteu
 _BUYER_LABEL_RX  = _re.compile(r"(?:^|\s)(?:DESTINATAIRE|Client|Acheteur|Buyer|To)\s*:?\s*$", _re.I)
 
 def _pre_clean_text(t: str) -> str:
-    """Supprime lignes méta (file://, Capture d’écran...), compresse espaces."""
     if not t:
         return t
     out = []
@@ -130,7 +125,6 @@ def _first_nonempty(lines: List[str], start: int) -> int:
     return i
 
 def _block_after_label(lines: List[str], label_idx: int, max_lines: int = 5) -> str:
-    """Prend 1..max_lines lignes après un label, stop si un label/section connue arrive."""
     i = _first_nonempty(lines, label_idx + 1)
     collected: List[str] = []
     for k in range(i, min(i + 12, len(lines))):
@@ -150,7 +144,6 @@ def _block_after_label(lines: List[str], label_idx: int, max_lines: int = 5) -> 
     return "\n".join(collected).strip()
 
 def _fix_parties_from_labels(text: str, fields: Dict[str, Any]) -> None:
-    """Si seller/buyer manquants ou suspects, tente une extraction par proximité de labels."""
     lines = [l for l in (text or "").splitlines()]
     seller_block = None
     buyer_block  = None
@@ -189,14 +182,9 @@ def _fix_parties_from_labels(text: str, fields: Dict[str, Any]) -> None:
                 break
             chunk.append(l)
         cleaned = "\n".join(chunk).strip()
-        if len(cleaned) >= 6:
-            fields["buyer"] = cleaned
-        else:
-            fields["buyer"] = None
+        fields["buyer"] = cleaned if len(cleaned) >= 6 else None
 
-
-# ---------- Heuristique “ça ressemble à une facture ?” ----------
-
+# ---------- Heuristique facture ----------
 def _looks_like_invoice_text(t: str) -> bool:
     t_low = (t or "").lower()
     markers = ["facture", "invoice", "total", "tva", "montant", "pu", "qté", "ttc", "t.t.c", "€"]
@@ -205,7 +193,6 @@ def _looks_like_invoice_text(t: str) -> bool:
     if _re.search(r"\b\d{1,3}(?:[ .]\d{3})*(?:[,.]\d{2})\b", t or ""):
         return True
     return False
-
 
 # ---------- Extraction principale ----------
 
@@ -239,7 +226,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     }
     fields = result["fields"]
 
-    # ---------- IMAGES -> OCR ----------
+    # ---------- IMAGES ----------
     if ext in {".png", ".jpg", ".jpeg"}:
         txt, info = ocr_image_to_text(p, lang="fra+eng")
         if info.get("error"):
@@ -250,7 +237,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             result["meta"]["ocr_pages"] = 0
             return result
 
-        # normalisations OCR
         txt = _re.sub(r'(ÉMETTEUR\s*:)\s*(DESTINATAIRE\s*:)', r'\1\n\2', txt, flags=_re.I)
         txt = _re.sub(r'(FACTURE)\s*(?:N[°o]|Nº|No)\b', r'\1 N°', txt, flags=_re.I)
         txt = _pre_clean_text(txt)
@@ -267,7 +253,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         _fill_fields_from_text(result, txt)
         _fix_parties_from_labels(txt, fields)
 
-        # rattrapage montants
         if fields.get("total_ttc") is None:
             ttc = _search_amount(txt, TOTAL_TTC_NEAR_RE)
             if ttc is not None:
@@ -285,7 +270,6 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             if tva is not None:
                 fields["total_tva"] = tva
 
-        # lignes (regex fallback sur OCR)
         lines = parse_lines_regex(txt)
         if lines:
             result["lines"] = lines
@@ -307,11 +291,10 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
             vat_rate = _extract_vat_rate(txt)
             _post_compute_totals(fields, vat_rate)
 
-        # hint parties
         (result["meta"].setdefault("hints", {}))["parties_strategy"] = "ocr_blocks_labels"
         return result
 
-    # ---------- PDF TEXTE (pdfminer) ----------
+    # ---------- PDF TEXTE ----------
     text_raw = pdf_text(p) or ""
     text = _pre_clean_text(text_raw)
     result["text"] = text[:20000]
@@ -362,7 +345,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
                     f"pdf_ocr:{oinfo.get('error')}:{oinfo.get('details','')}".strip()
                 )
 
-    # Rattrapage montants (pdfminer ou OCR)
+    # ---------- Rattrapage montants ----------
     if fields.get("total_ttc") is None:
         ttc = _search_amount(text, TOTAL_TTC_NEAR_RE)
         if ttc is not None:
@@ -380,7 +363,7 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         if tva is not None:
             fields["total_tva"] = tva
 
-    # Lignes
+    # ---------- Lignes ----------
     lines: List[Dict[str, Any]] | None = None
 
     if not ocr_used:
@@ -419,13 +402,9 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
         vat_rate = _extract_vat_rate(text)
         _post_compute_totals(fields, vat_rate)
 
-    # hint parties (quel chemin a permis d'avoir des parties)
     (result["meta"].setdefault("hints", {}))["parties_strategy"] = (
-        "blocks"
-        if (fields.get("seller") and fields.get("buyer"))
-        else "labels"
-        if (fields.get("seller") or fields.get("buyer"))
+        "blocks" if (fields.get("seller") and fields.get("buyer"))
+        else "labels" if (fields.get("seller") or fields.get("buyer"))
         else "header_fallback"
     )
-
     return result
