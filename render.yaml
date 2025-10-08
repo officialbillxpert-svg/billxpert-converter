@@ -3,5 +3,8 @@ services:
     name: billxpert-converter
     env: docker
     plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TESSDATA_PREFIX
+        value: /usr/share/tesseract-ocr/5/tessdata
     healthCheckPath: /healthz
-    autoDeploy: true
