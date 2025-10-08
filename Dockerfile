@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     VIRTUAL_ENV=/opt/venv
 
-# OS deps + Tesseract (eng+fra)
+# --- Installation OS + Tesseract (fra + eng) ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         tesseract-ocr tesseract-ocr-fra \
@@ -14,21 +14,23 @@ RUN apt-get update && \
         build-essential gcc && \
     rm -rf /var/lib/apt/lists/*
 
-# venv
+# --- Crée un environnement virtuel ---
 RUN python -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# --- Copie du projet ---
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt
-
+RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . .
 
-# très important pour Tesseract 5
+# --- Variable importante pour Tesseract 5 ---
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
-# EXPOSE facultatif sur Render (tu peux le laisser)
+# --- Port d’écoute (facultatif pour Render) ---
 EXPOSE 10000
 
-# ⚠️ Bind sur le PORT dynamique de Render
-CMD ["bash","-lc","gunicorn app.main:app --bind 0.0.0.0:${PORT:-10000} --workers 2 --timeout 120"]
+# --- Commande de lancement ---
+# Render fournit une variable d'environnement $PORT automatiquement.
+# On appelle Gunicorn via son chemin absolu pour éviter le "command not found"
+CMD ["bash", "-lc", "/opt/venv/bin/gunicorn app.main:app --bind 0.0.0.0:${PORT:-10000} --workers 2 --timeout 120"]
