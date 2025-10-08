@@ -11,17 +11,13 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-# --- Extractor ---
 from app.extractors.pdf_basic import extract_document as _extract
 
 ALLOWED_EXTS = {".pdf", ".png", ".jpg", ".jpeg"}
 
 app = Flask(__name__)
 CORS(app)
-
-# Limite de taille d’upload (25 Mo)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
-
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 Mo
 
 # ---------- Helpers ----------
 def _json_ok(data: Dict[str, Any], status: int = 200):
@@ -29,10 +25,8 @@ def _json_ok(data: Dict[str, Any], status: int = 200):
     resp.status_code = status
     return resp
 
-
 def _json_err(error: str, details: str = "", status: int = 400):
     return _json_ok({"success": False, "error": error, "details": details}, status=status)
-
 
 def _save_upload_to_tmp() -> Path:
     if "file" not in request.files:
@@ -41,13 +35,10 @@ def _save_upload_to_tmp() -> Path:
     if not f or not f.filename:
         raise ValueError("no_file")
 
-    # Vérifie que le flux n'est pas vide
-    try:
-        f.stream.seek(0, io.SEEK_END)
-        size = f.stream.tell()
-        f.stream.seek(0)
-    except Exception:
-        size = None
+    # vérif taille != 0
+    f.stream.seek(0, io.SEEK_END)
+    size = f.stream.tell()
+    f.stream.seek(0)
     if size == 0:
         raise ValueError("empty_file")
 
@@ -62,21 +53,10 @@ def _save_upload_to_tmp() -> Path:
     tmp.close()
     return Path(tmp.name)
 
-
 # ---------- Routes ----------
-@app.get("/")
-def index():
-    return jsonify({
-        "ok": True,
-        "service": "billxpert-converter",
-        "endpoints": ["/healthz", "/check-libs", "/diag", "/api/convert", "/api/summary", "/api/summary.csv", "/api/lines", "/api/lines.csv"]
-    }), 200
-
-
 @app.get("/healthz")
 def healthz():
     return "ok", 200
-
 
 @app.get("/check-libs")
 def check_libs():
@@ -91,7 +71,6 @@ def check_libs():
             result[lib] = f"❌ {type(e).__name__}: {e}"
     return jsonify(result), 200
 
-
 @app.get("/diag")
 def diag():
     import shutil, subprocess
@@ -99,6 +78,7 @@ def diag():
         import pytesseract
         pt_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", None)
     except Exception:
+        pytesseract = None  # noqa
         pt_cmd = None
 
     which = shutil.which("tesseract")
@@ -117,7 +97,6 @@ def diag():
         "list_langs_error": err,
     })
 
-
 @app.post("/api/convert")
 def api_convert():
     try:
@@ -134,7 +113,6 @@ def api_convert():
             Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
         except Exception:
             pass
-
 
 @app.post("/api/summary")
 def api_summary():
@@ -159,7 +137,6 @@ def api_summary():
             "total_ttc":      fields.get("total_ttc"),
             "currency":       fields.get("currency"),
             "lines_count":    fields.get("lines_count"),
-            # debug
             "line_strategy":  meta.get("line_strategy"),
             "ocr_used":       meta.get("ocr_used"),
         }
@@ -173,7 +150,6 @@ def api_summary():
             Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
         except Exception:
             pass
-
 
 @app.post("/api/summary.csv")
 def api_summary_csv():
@@ -205,7 +181,7 @@ def api_summary_csv():
         writer = csv.DictWriter(output, fieldnames=list(flat.keys()), delimiter=';', extrasaction="ignore")
         writer.writeheader()
         writer.writerow(flat)
-        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))  # BOM UTF-8 (Excel-friendly)
+        mem = io.BytesIO(("\ufeff" + output.getvalue()).encode("utf-8"))
         return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="billxpert_summary.csv")
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
@@ -214,7 +190,6 @@ def api_summary_csv():
             Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
         except Exception:
             pass
-
 
 @app.post("/api/lines")
 def api_lines():
@@ -237,7 +212,6 @@ def api_lines():
             Path(path).unlink(missing_ok=True)  # type: ignore[arg-type]
         except Exception:
             pass
-
 
 @app.post("/api/lines.csv")
 def api_lines_csv():
@@ -270,7 +244,5 @@ def api_lines_csv():
         except Exception:
             pass
 
-
 if __name__ == "__main__":
-    # Support des deux modes de lancement
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
