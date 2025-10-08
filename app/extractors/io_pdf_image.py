@@ -11,25 +11,12 @@ DEFAULT_TIMEOUT = 25
 # ---------- Chargement & prétraitement images ----------
 
 def _load_image(path: Path) -> Image.Image:
-    """
-    Charge une image depuis disque (binaire) et force le .load() pour éviter
-    des lazy-reads sur certains drivers.
-    """
     with open(path, "rb") as f:
         img = Image.open(io.BytesIO(f.read()))
         img.load()
     return img
 
-
 def _pil_basic_preprocess(img: Image.Image) -> Image.Image:
-    """
-    Prétraitement léger et robuste (PIL only) :
-      - niveaux de gris
-      - autocontrast (clip 2%)
-      - lissage (median 3)
-      - equalize
-      - resize max 2400 px (upsample <= 1.5x)
-    """
     g = img.convert("L")
     g = ImageOps.autocontrast(g, cutoff=2)
     g = g.filter(ImageFilter.MedianFilter(size=3))
@@ -42,47 +29,65 @@ def _pil_basic_preprocess(img: Image.Image) -> Image.Image:
         g = g.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     return g
 
-
 def _cv2_binarize_if_available(img: Image.Image) -> Image.Image:
-    """
-    Si OpenCV est dispo, applique une binarisation/adaptive threshold
-    souvent très utile pour les scans pâles.
-    """
     try:
         import numpy as np
         import cv2
-
         arr = np.array(img.convert("L"))
-        # légère égalisation puis adaptive threshold
         arr = cv2.equalizeHist(arr)
-        thr = cv2.adaptiveThreshold(arr, 255,
-                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 35, 11)
+        thr = cv2.adaptiveThreshold(
+            arr, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 35, 11
+        )
         return Image.fromarray(thr)
     except Exception:
-        # OpenCV non installé ou erreur : on retourne l'image d'origine
         return img
 
+def _detect_rotation_osd(img: Image.Image) -> int:
+    """
+    Utilise Tesseract OSD pour estimer la rotation (0, 90, 180, 270).
+    Retourne l'angle (degrés) à appliquer pour remettre le texte à l'endroit.
+    """
+    try:
+        # on downsizze un peu pour éviter les timeouts
+        w, h = img.size
+        sf = 1600 / max(w, h) if max(w, h) > 1600 else 1.0
+        probe = img if sf == 1.0 else img.resize((int(w * sf), int(h * sf)), Image.LANCZOS)
+        osd = pytesseract.image_to_osd(probe, lang="eng")  # OSD aime bien "eng"
+        # Ex: "Rotate: 90\nOrientation: ...\n"
+        for line in osd.splitlines():
+            line = line.strip().lower()
+            if line.startswith("rotate:"):
+                val = line.split(":")[1].strip()
+                deg = int("".join(ch for ch in val if ch.isdigit()))
+                # deg = 0, 90, 180, 270 (sens horaire)
+                # pour corriger, on doit tourner dans l'autre sens
+                return (360 - deg) % 360
+    except Exception:
+        pass
+    return 0
+
+def _apply_rotation(img: Image.Image, deg: int) -> Image.Image:
+    if deg in (0, 360, None):
+        return img
+    return img.rotate(deg, expand=True)
 
 def _preprocess(img: Image.Image) -> Image.Image:
-    """
-    Pipeline de prétraitement :
-      - PIL basique
-      - puis tentative OpenCV (si dispo)
-    """
+    # 1) rotation auto sur l'image brute pour maximiser l'OSD
+    rot = _detect_rotation_osd(img)
+    if rot:
+        img = _apply_rotation(img, rot)
+    # 2) pipeline PIL
     g = _pil_basic_preprocess(img)
+    # 3) binarisation (si opencv présent)
     g = _cv2_binarize_if_available(g)
     return g
 
-
 def _tesseract_try(img: Image.Image, lang: str, cfg: str, timeout: int) -> Tuple[str, Dict[str, Any]]:
-    """
-    Lance Tesseract avec un profil donné et renvoie (texte, info).
-    """
     txt = pytesseract.image_to_string(img, lang=lang, config=cfg, timeout=timeout)
     txt = txt.replace("\x00", "").strip()
     return txt, {"ocr_lang": lang, "tesseract_config": cfg, "timeout_s": timeout}
-
 
 # ---------- OCR Image unique (PNG/JPG) ----------
 
@@ -91,11 +96,6 @@ def ocr_image_to_text(
     lang: str = "fra+eng",
     timeout: Optional[int] = None
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    OCR d'une image (ou d'un objet PIL Image) avec plusieurs profils de secours.
-    Ne lève pas d'exception : renvoie ('', info{error=...}) en cas d'échec.
-    Essaie fra+eng puis fallback en 'eng' si les data FR ne sont pas présentes.
-    """
     timeout = timeout or DEFAULT_TIMEOUT
     try:
         img = path_or_image if isinstance(path_or_image, Image.Image) else _load_image(Path(path_or_image))
@@ -110,11 +110,11 @@ def ocr_image_to_text(
         warnings.append(f"preprocess_failed:{e}")
 
     profiles = [
-        "--oem 3 --psm 6",   # LSTM + lignes
-        "--oem 1 --psm 3",   # LSTM + bloc
-        "--oem 3 --psm 4",   # LSTM + colonnes
-        "--oem 3 --psm 11",  # sparse
-        "--oem 0 --psm 6",   # Legacy engine
+        "--oem 3 --psm 6",
+        "--oem 1 --psm 3",
+        "--oem 3 --psm 4",
+        "--oem 3 --psm 11",
+        "--oem 0 --psm 6",
     ]
 
     def _run_profiles(img_: Image.Image, lang_: str) -> Tuple[str, Dict[str, Any]]:
@@ -128,7 +128,6 @@ def ocr_image_to_text(
                     return txt, info
                 warnings.append(f"empty_text:{cfg}")
             except RuntimeError as e:
-                # pytesseract lève RuntimeError sur timeout
                 last_err_local = f"RuntimeError:{e}"
                 if "timeout" in str(e).lower():
                     try:
@@ -151,9 +150,7 @@ def ocr_image_to_text(
             "tried_lang": lang_,
         }
 
-    # Première passe avec la langue demandée (fra+eng par défaut)
     txt, info = _run_profiles(pim, lang)
-    # Si erreur due aux data langue manquantes, on retente en 'eng'
     if (not txt) and isinstance(info, dict) and ("details" in info):
         det = str(info.get("details") or "").lower()
         if "failed loading language" in det or "not available" in det or "tesseract couldn't load any languages" in det:
@@ -164,17 +161,9 @@ def ocr_image_to_text(
 
     return txt, info
 
-
-# ---------- Extraction texte natif PDF (pdfminer.six + fallback pdfplumber) ----------
+# ---------- Extraction texte natif PDF ----------
 
 def pdf_text(path: Path) -> str:
-    """
-    Tente d'extraire le texte natif d’un PDF (non scanné).
-    1) pdfminer.six
-    2) fallback pdfplumber (souvent meilleur sur certaines mises en page)
-    Renvoie '' en cas d'erreur.
-    """
-    # Pass 1 : pdfminer
     try:
         from pdfminer.high_level import extract_text
         t = extract_text(str(path)) or ""
@@ -182,8 +171,6 @@ def pdf_text(path: Path) -> str:
             return t
     except Exception:
         pass
-
-    # Pass 2 : pdfplumber
     try:
         import pdfplumber
         out = []
@@ -196,11 +183,9 @@ def pdf_text(path: Path) -> str:
     except Exception:
         return ""
 
-
-# ---------- OCR des PDF scannés (pypdfium2 + Tesseract) ----------
+# ---------- OCR PDF (pypdfium2 + Tesseract) ----------
 
 def _pdf_to_images_pypdfium2(path: Path, dpi: int) -> List[Image.Image]:
-    """Rend les pages PDF (jusqu’à max_pages côté appelant) en images PIL via pypdfium2."""
     import pypdfium2 as pdfium
     pdf = pdfium.PdfDocument(str(path))
     try:
@@ -208,6 +193,10 @@ def _pdf_to_images_pypdfium2(path: Path, dpi: int) -> List[Image.Image]:
         for i in range(len(pdf)):
             page = pdf[i]
             pil = page.render(scale=dpi / 72.0).to_pil()
+            # rotation OSD avant préprocess (comme pour image)
+            rot = _detect_rotation_osd(pil)
+            if rot:
+                pil = _apply_rotation(pil, rot)
             images.append(pil)
         return images
     finally:
@@ -216,19 +205,13 @@ def _pdf_to_images_pypdfium2(path: Path, dpi: int) -> List[Image.Image]:
         except Exception:
             pass
 
-
 def pdf_ocr_text(
     path: Path,
     lang: str = "fra+eng",
     max_pages: int = 5,
-    dpi: int = 220,
-    timeout_per_page: int = 25
+    dpi: int = 280,
+    timeout_per_page: int = 30
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Rasterise jusqu'à 'max_pages' avec pypdfium2, applique Tesseract page par page.
-    Double passe DPI : 220 puis 300 si rien n’est lu.
-    Retourne (texte_concaténé, info). N'échoue pas en exception.
-    """
     info: Dict[str, Any] = {"ocr_lang": lang, "ocr_pages": 0, "passes": []}
 
     def _run_pass(_dpi: int) -> Tuple[str, Dict[str, Any]]:
@@ -242,7 +225,9 @@ def pdf_ocr_text(
         take = min(len(imgs), max_pages)
         for i in range(take):
             try:
-                t, run = ocr_image_to_text(imgs[i], lang=lang, timeout=timeout_per_page)
+                # préprocess complet ici
+                pim = _preprocess(imgs[i])
+                t, run = ocr_image_to_text(pim, lang=lang, timeout=timeout_per_page)
                 if run.get("warnings"):
                     warnings.extend(run["warnings"])
                 texts.append(t or "")
@@ -253,20 +238,17 @@ def pdf_ocr_text(
         meta = {"dpi": _dpi, "ocr_pages": take, "warnings": warnings}
         return full, meta
 
-    # 1ère passe
     full, meta1 = _run_pass(dpi)
     info["passes"].append(meta1)
     info["ocr_pages"] = max(info.get("ocr_pages", 0), meta1.get("ocr_pages", 0))
 
     if not full:
-        # 2ème passe plus précise
-        full2, meta2 = _run_pass(300)
+        full2, meta2 = _run_pass(320)
         info["passes"].append(meta2)
         info["ocr_pages"] = max(info.get("ocr_pages", 0), meta2.get("ocr_pages", 0))
         full = full2
 
     if not full:
-        # Aggrège les warnings lisibles
         all_warns = []
         for p in info.get("passes", []):
             all_warns.extend(p.get("warnings", []))
@@ -278,7 +260,6 @@ def pdf_ocr_text(
         return "", info
 
     return full, info
-
 
 __all__ = [
     "DEFAULT_TIMEOUT",
