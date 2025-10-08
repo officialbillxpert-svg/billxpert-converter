@@ -14,6 +14,7 @@ RUN apt-get update && \
         build-essential gcc && \
     rm -rf /var/lib/apt/lists/*
 
+# venv
 RUN python -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
@@ -26,5 +27,8 @@ COPY . .
 # très important pour Tesseract 5
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
+# EXPOSE facultatif sur Render (tu peux le laisser)
 EXPOSE 10000
-CMD ["gunicorn", "app.main:app", "--bind", "0.0.0.0:10000", "--workers", "2", "--timeout", "120"]
+
+# ⚠️ Bind sur le PORT dynamique de Render
+CMD ["bash","-lc","gunicorn app.main:app --bind 0.0.0.0:${PORT:-10000} --workers 2 --timeout 120"]
