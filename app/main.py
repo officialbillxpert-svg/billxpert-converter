@@ -54,6 +54,11 @@ def _save_upload_to_tmp() -> Path:
     return Path(tmp.name)
 
 # ---------- Routes ----------
+@app.get("/")
+def root():
+    # pour health check rapide
+    return "ok", 200
+
 @app.get("/healthz")
 def healthz():
     return "ok", 200
@@ -104,7 +109,8 @@ def api_convert():
     except ValueError as e:
         return _json_err("bad_request", str(e), 400)
     try:
-        data = _extract(str(path), ocr="auto")
+        ocr_mode = (request.args.get("ocr") or "auto").lower()
+        data = _extract(str(path), ocr=ocr_mode)
         return _json_ok(data, 200)
     except Exception as e:
         return _json_err("server_error", f"{type(e).__name__}: {e}", 500)
@@ -121,7 +127,8 @@ def api_summary():
     except ValueError as e:
         return _json_err("bad_request", str(e), 400)
     try:
-        data = _extract(str(path), ocr="auto") or {}
+        ocr_mode = (request.args.get("ocr") or "auto").lower()
+        data = _extract(str(path), ocr=ocr_mode) or {}
         meta = data.get("meta") or {}
         fields = data.get("fields") or {}
         flat = {
@@ -158,7 +165,8 @@ def api_summary_csv():
     except ValueError as e:
         return _json_err("bad_request", str(e), 400)
     try:
-        data = _extract(str(path), ocr="auto") or {}
+        ocr_mode = (request.args.get("ocr") or "auto").lower()
+        data = _extract(str(path), ocr=ocr_mode) or {}
         meta = data.get("meta") or {}
         fields = data.get("fields") or {}
         flat = {
@@ -198,7 +206,8 @@ def api_lines():
     except ValueError as e:
         return _json_err("bad_request", str(e), 400)
     try:
-        data = _extract(str(path), ocr="auto") or {}
+        ocr_mode = (request.args.get("ocr") or "auto").lower()
+        data = _extract(str(path), ocr=ocr_mode) or {}
         lines = data.get("lines") or []
         return _json_ok({
             "count": len(lines),
@@ -220,7 +229,8 @@ def api_lines_csv():
     except ValueError as e:
         return _json_err("bad_request", str(e), 400)
     try:
-        data = _extract(str(path), ocr="auto") or {}
+        ocr_mode = (request.args.get("ocr") or "auto").lower()
+        data = _extract(str(path), ocr=ocr_mode) or {}
         rows: List[Dict[str, Any]] = data.get("lines") or []
         fieldnames = ["ref", "label", "qty", "unit_price", "amount"]
         output = io.StringIO()
