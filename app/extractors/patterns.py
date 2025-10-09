@@ -1,97 +1,26 @@
+# app/extractors/patterns.py
 from __future__ import annotations
 import re
 
-# ---------- Version ----------
-PATTERNS_VERSION = "v2025-10-04a"
+PATTERNS_VERSION = "v1.0.0"
 
-# ---------- Numéro / Date ----------
-FACTURE_NO_RE = re.compile(
-    r'(?:FACTURE|Facture)\s*(?:N[°o]|No|Nº)\s*[:#-]?\s*([A-Z0-9][A-Z0-9\-\/\.]{2,})',
-    re.I
-)
-INVOICE_NUM_RE = re.compile(r'Num[ée]ro\s*[:#-]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
-NUM_RE         = re.compile(r'(?:Facture|Invoice|N[°o]|No|Nº)\s*[:#-]?\s*([A-Z0-9\-\/\.]{3,})', re.I)
+DATE_RE = re.compile(r"(?:^|[^0-9])((?:\d{1,2}[./-]){2}\d{2,4}|\d{4}-\d{2}-\d{2})(?:$|[^0-9])")
+FACTURE_NO_RE = re.compile(r"(?:facture\s*(?:n°|no|num(?:éro)?|#)?\s*[:\-\s]*|invoice\s*(?:no|#)?\s*[:\-\s]*)([A-Za-z0-9._\-/]+)", re.IGNORECASE)
+INVOICE_NUM_RE = re.compile(r"(?:\b(?:n°|no|num(?:éro)?|#)\s*[:\-\s]*)([A-Za-z0-9._\-/]+)", re.IGNORECASE)
 
-DATE_RE = re.compile(
-    r'(\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{2,4}|\d{4}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{1,2})'
-)
+EUR_STRICT_RE = re.compile(r"\b\d{1,3}(?:[\s\u00A0.]\d{3})*(?:[.,]\d{2})\b")
+TOTAL_TTC_NEAR_RE = re.compile(r"(total\s*t\s*t\s*c|ttc|total\s*ttc|montant\s*ttc)", re.IGNORECASE)
+TOTAL_HT_NEAR_RE  = re.compile(r"(total\s*h\s*t|ht|total\s*ht|montant\s*ht)", re.IGNORECASE)
+TVA_AMOUNT_NEAR_RE = re.compile(r"(tva|taxe\s*\b|vat)", re.IGNORECASE)
 
-# ---------- Totaux ----------
-# Plus tolérant aux confusions OCR ("Total MT", "TTC" variés, espaces, etc.)
-TOTAL_TTC_NEAR_RE = re.compile(
-    r'(?:Total\s*(?:T[TC]C?|TT[C€]|Grand\s*total|Total\s*amount|Total\s*à\s*payer))\s*[:\-]?\s*[^\n\r]{0,80}?'
-    r'([0-9][0-9\.\,\s]+)\s*€?',
-    re.I
-)
-TOTAL_HT_NEAR_RE = re.compile(
-    r'Total\s*[HNM][T1]\s*[:\-]?\s*[^\n\r]{0,80}?([0-9][0-9\.\,\s]+)\s*€?',
-    re.I
-)
+VAT_RATE_RE = re.compile(r"(\d{1,2}(?:[.,]\d)?\s*%)")
 
-# TVA (montant) — forcer € pour éviter de prendre "20" de "TVA 20%"
-TVA_AMOUNT_NEAR_RE = re.compile(
-    r'\bTVA\b[^\n\r]{0,120}?(?:\d{1,2}[.,]?\d?\s*%\s*[^\n\r]{0,30})?([0-9][0-9\.\,\s]+)\s*€',
-    re.I
-)
-TVA_NEAR_RE = TVA_AMOUNT_NEAR_RE
+SELLER_BLOCK = re.compile(r"(?s)(?:vendeur|société|entreprise|emetteur|from)\s*[:\n]+(.{10,300})", re.IGNORECASE)
+CLIENT_BLOCK = re.compile(r"(?s)(?:client|destinataire|acheteur|to)\s*[:\n]+(.{10,300})", re.IGNORECASE)
+EMETTEUR_BLOCK = re.compile(r"(?s)(?:émetteur|emetteur)\s*[:\n]+(.{10,300})", re.IGNORECASE)
+DESTINATAIRE_BLOCK = re.compile(r"(?s)(?:destinataire)\s*[:\n]+(.{10,300})", re.IGNORECASE)
 
-EUR_STRICT_RE = re.compile(r'([0-9]+(?:[ \.,][0-9]{3})*(?:[\,\.][0-9]{2}))\s*€?')
-
-# ---------- Taux de TVA ----------
-VAT_RATE_RE = re.compile(r'(?:TVA|VAT)\s*[:=]?\s*(20|10|5[.,]?5)\s*%?', re.I)
-
-# ---------- IDs FR ----------
-SIRET_RE = re.compile(r'\b\d{14}\b')
-SIREN_RE = re.compile(r'(?<!\d)\d{9}(?!\d)')
-TVA_RE   = re.compile(r'\bFR[a-zA-Z0-9]{2}\s?\d{9}\b')
-IBAN_RE  = re.compile(r'\bFR\d{2}(?:\s?\d{4}){3}\s?(?:\d{4}\s?\d{3}\s?\d{5}|\d{11})\b')
-
-# ---------- Blocs parties ----------
-# On ajoute plus de libellés possibles (FR/EN) + tolérance OCR
-SELLER_BLOCK = re.compile(
-    r'(?:^|\n)\s*(?:Émetteur|Emetteur|Vendeur|Venteur|Seller|From|Issuer|Soci[ée]t[ée]|Entreprise|Company)\s*:?\s*'
-    r'(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:Client|Acheteur|Buyer|Destinataire|DESTINATAIRE|Bill\s*to|Invoice\s*to)\b)|\Z)',
-    re.I | re.S
-)
-CLIENT_BLOCK = re.compile(
-    r'(?:^|\n)\s*(?:Client|Cliente|Acheteur|Buyer|Bill\s*to|Invoice\s*to|Destinataire|DESTINATAIRE|Ship\s*to)\s*:?\s*'
-    r'(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:Émetteur|Emetteur|Vendeur|Seller|From|Issuer|Soci[ée]t[ée])\b)|\Z)',
-    re.I | re.S
-)
-
-# Cas où les titres sont typés fort (majuscules)
-EMETTEUR_BLOCK = re.compile(
-    r'(?:^|\n)\s*(?:ÉMETTEUR|EMETTEUR)\s*:?\s*(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:DESTINATAIRE|Client|Acheteur|Buyer|Bill\s*to)\b)|\Z)',
-    re.I | re.S
-)
-DESTINATAIRE_BLOCK = re.compile(
-    r'(?:^|\n)\s*(?:DESTINATAIRE)\s*:?\s*(?P<blk>.+?)(?=(?:\n{2,})|(?:\n\s*(?:ÉMETTEUR|EMETTEUR|Seller|Vendeur|From|Issuer)\b)|\Z)',
-    re.I | re.S
-)
-
-# ---------- Lignes ----------
-TABLE_HEADER_HINTS = [
-    ("ref", "réf", "reference", "code"),
-    ("désignation", "designation", "libellé", "description", "label"),
-    ("qté", "qte", "qty", "quantité"),
-    ("pu", "prix unitaire", "unit price"),
-    ("montant", "total", "amount")
-]
-
-FOOTER_NOISE_PAT = re.compile(r'(merci|paiement|iban|file://|conditions|due date|bank|html)', re.I)
-
-LINE_RX = re.compile(
-    r'^(?P<ref>[A-Z0-9][A-Z0-9\-_/]{1,})\s+[—\-]\s+(?P<label>.+?)\s+'
-    r'(?P<qty>\d{1,3})\s+(?P<pu>[0-9\.\,\s]+(?:€)?)\s+(?P<amt>[0-9\.\,\s]+(?:€)?)$',
-    re.M
-)
-
-__all__ = [
-    "PATTERNS_VERSION",
-    "FACTURE_NO_RE", "INVOICE_NUM_RE", "NUM_RE", "DATE_RE",
-    "TOTAL_TTC_NEAR_RE", "TOTAL_HT_NEAR_RE", "TVA_AMOUNT_NEAR_RE", "TVA_NEAR_RE",
-    "EUR_STRICT_RE", "VAT_RATE_RE",
-    "SIRET_RE", "SIREN_RE", "TVA_RE", "IBAN_RE",
-    "SELLER_BLOCK", "CLIENT_BLOCK", "EMETTEUR_BLOCK", "DESTINATAIRE_BLOCK",
-    "TABLE_HEADER_HINTS", "FOOTER_NOISE_PAT", "LINE_RX",
-]
+TVA_RE   = re.compile(r"\bTVA\b\s*:?\s*([A-Z0-9\s]+)", re.IGNORECASE)
+SIRET_RE = re.compile(r"\bSIRET\b\s*:?\s*(\d{14})", re.IGNORECASE)
+SIREN_RE = re.compile(r"\bSIREN\b\s*:?\s*(\d{9})", re.IGNORECASE)
+IBAN_RE  = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
