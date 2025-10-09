@@ -1,3 +1,4 @@
 # app/extractors/__init__.py
-"""Package extractors – fichier ultra-léger pour éviter les imports circulaires."""
-__all__ = []
+from __future__ import annotations
+from .pdf_basic import extract_document
+__all__ = ["extract_document"]
