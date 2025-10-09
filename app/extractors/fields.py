@@ -1,4 +1,4 @@
-# app/extractors/fields.py
+
 from __future__ import annotations
 import re
 from typing import Dict, Any, Tuple, Optional
@@ -21,6 +21,7 @@ def _extract_invoice_date(text: str) -> Optional[str]:
 
 def _extract_totals(text: str) -> Dict[str, Any]:
     total_ttc = total_ht = total_tva = None
+    # proximity: look at lines
     for line in text.splitlines():
         low = line.lower()
         if TOTAL_TTC_NEAR_RE.search(low):
@@ -50,6 +51,7 @@ def _fill_fields_from_text(text: str) -> Dict[str, Any]:
     if seller: fields["seller"] = seller
     if buyer:  fields["buyer"] = buyer
 
+    # extra ids
     tva = _first_group(TVA_RE.search(text))
     if tva: fields["seller_vat"] = tva
     siret = _first_group(SIRET_RE.search(text))

@@ -1,4 +1,4 @@
-# app/extractors/pdf_basic.py
+
 from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -14,7 +14,7 @@ def _looks_like_invoice_text(t: str) -> bool:
     markers = ["facture", "invoice", "total", "tva", "montant", "ttc", "€"]
     if any(m in t_low for m in markers):
         return True
-    if _re.search(r"\b\d{1,3}(?:[ .]\d{3})*(?:[,.]\d{2})\b", t or ""):
+    if _re.search(r"\\b\\d{1,3}(?:[ .]\\d{3})*(?:[,.]\\d{2})\\b", t or ""):
         return True
     return False
 
@@ -30,6 +30,7 @@ def _extract_vat_rate(text: str) -> Optional[float]:
 
 def _post_compute_totals(fields: Dict[str, Any], vat_rate: Optional[float]) -> None:
     ht, tva, ttc = fields.get("total_ht"), fields.get("total_tva"), fields.get("total_ttc")
+    # compute missing piece if possible
     if ht is not None and ttc is not None and tva is None:
         fields["total_tva"] = round(float(ttc) - float(ht), 2)
     elif ht is not None and tva is not None and ttc is None:
@@ -67,9 +68,11 @@ def extract_document(path: str, ocr: str = "auto") -> Dict[str, Any]:
     fields = _fill_fields_from_text(text or "")
     result["fields"] = fields
 
+    # Post-compute totals
     vat_rate = _extract_vat_rate(text or "")
     _post_compute_totals(fields, vat_rate)
 
+    # hints
     result["meta"].setdefault("hints", {})["parties_strategy"] = "labels" if (fields.get("seller") or fields.get("buyer")) else "fallback"
 
     return result

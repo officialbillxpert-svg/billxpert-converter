@@ -1,4 +1,4 @@
-# app/main.py
+
 from __future__ import annotations
 import io
 from pathlib import Path
@@ -29,6 +29,7 @@ def create_app() -> Flask:
             if ext not in ALLOWED_EXTS:
                 return _json_err("unsupported_type", f"Extension non supportée: {ext}", 415)
 
+            # save to a temp file
             tmp = Path(app.instance_path) / "uploads"
             tmp.mkdir(parents=True, exist_ok=True)
             safe_name = secure_filename(file.filename)
