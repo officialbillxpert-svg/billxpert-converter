@@ -1,4 +1,6 @@
-# app/extractors/__init__.py
-# Keep this package lightweight to avoid circular imports.
-# Do NOT import pdf_basic here.
-__all__ = []
+# app/__init__.py
+from __future__ import annotations
+from flask import Flask
+from .main import create_app
+
+__all__ = ["create_app"]
