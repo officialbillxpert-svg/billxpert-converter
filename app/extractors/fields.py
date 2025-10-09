@@ -1,236 +1,61 @@
 # app/extractors/fields.py
 from __future__ import annotations
 import re
-
+from typing import Dict, Any, Tuple, Optional
 from .patterns import (
-    FACTURE_NO_RE, INVOICE_NUM_RE, NUM_RE, DATE_RE,
-    TOTAL_TTC_NEAR_RE, TOTAL_HT_NEAR_RE, TVA_AMOUNT_NEAR_RE, EUR_STRICT_RE,
+    FACTURE_NO_RE, INVOICE_NUM_RE, DATE_RE, EUR_STRICT_RE,
+    TOTAL_TTC_NEAR_RE, TOTAL_HT_NEAR_RE, TVA_AMOUNT_NEAR_RE,
     SELLER_BLOCK, CLIENT_BLOCK, EMETTEUR_BLOCK, DESTINATAIRE_BLOCK,
-    TVA_RE, SIRET_RE, SIREN_RE, IBAN_RE,
+    TVA_RE, SIRET_RE, SIREN_RE, IBAN_RE
 )
 from .utils_amounts import _norm_amount, _clean_block
 
-# ---------- Normalisations OCR utiles ----------
-_OCR_SPACES_FIX = [
-    ("\u00A0", " "),  # NBSP
-    ("  ", " "),
-]
-_OCR_LABEL_FIX_RX = re.compile(r"(?:ÉMETTEUR|EMETTEUR)\s*[: ]*\s*(DESTINATAIRE)\s*:", re.I)
+def _first_group(m: Optional[re.Match]) -> Optional[str]:
+    return m.group(1).strip() if m else None
 
-def _normalize_ocr_text(t: str) -> str:
-    if not t:
-        return t
-    t = _OCR_LABEL_FIX_RX.sub(r"ÉMETTEUR:\n\1:", t)
-    for a, b in _OCR_SPACES_FIX:
-        t = t.replace(a, b)
-    return t
+def _extract_invoice_number(text: str) -> Optional[str]:
+    return _first_group(FACTURE_NO_RE.search(text)) or _first_group(INVOICE_NUM_RE.search(text))
 
-# ---------- Garde-fous pour blocs parties ----------
-STOP_WORDS_RX = re.compile(
-    r'\b('
-    r'Description|Désignation|Designations?|Items?|Lines?|'
-    r'Prix\s*Unitaire|Unit\s*Price|Quantité|Qty|Montant|Amount|'
-    r'Total(?:\s*HT|\s*TTC)?|Subtotal|Grand\s*total|TVA|VAT|'
-    r'R[èe]glement|Payment|Conditions?|Terms|'
-    r'file://|https?://'
-    r')\b', re.I
-)
-HEADER_NOISE_RX = re.compile(r'^\s*(FACTURE|INVOICE)\b', re.I)
-DATE_LINE_RX    = re.compile(r'^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?:\s+\d{1,2}:\d{2})?\s*$')
-ALL_NUMERIC_RX  = re.compile(r'^[\d\s./:-]+$')
+def _extract_invoice_date(text: str) -> Optional[str]:
+    return _first_group(DATE_RE.search(text))
 
-LABEL_ONLY_RX = re.compile(
-    r'^\s*(?:émetteur|emetteur|seller|from|issuer|destinataire|client|acheteur|buyer)\s*:?\s*$',
-    re.I
-)
-def _is_label_only(s: str | None) -> bool:
-    return bool(s) and bool(LABEL_ONLY_RX.match(s.strip()))
+def _extract_totals(text: str) -> Dict[str, Any]:
+    total_ttc = total_ht = total_tva = None
+    for line in text.splitlines():
+        low = line.lower()
+        if TOTAL_TTC_NEAR_RE.search(low):
+            m = EUR_STRICT_RE.search(line)
+            if m: total_ttc = _norm_amount(m.group(0))
+        elif TOTAL_HT_NEAR_RE.search(low):
+            m = EUR_STRICT_RE.search(line)
+            if m: total_ht = _norm_amount(m.group(0))
+        elif TVA_AMOUNT_NEAR_RE.search(low):
+            m = EUR_STRICT_RE.search(line)
+            if m: total_tva = _norm_amount(m.group(0))
+    return {"total_ht": total_ht, "total_tva": total_tva, "total_ttc": total_ttc}
 
-def _clip_at_stoppers(block: str) -> str:
-    """Coupe un bloc avant mots-clés de table/totaux et à la 1re double-ligne."""
-    if not block:
-        return ""
-    para = block.split("\n\n", 1)[0]
-    m = STOP_WORDS_RX.search(para)
-    if m:
-        para = para[:m.start()]
-    return para.strip()
+def _extract_parties(text: str) -> Tuple[Optional[str], Optional[str]]:
+    seller = (_first_group(SELLER_BLOCK.search(text)) or
+              _first_group(EMETTEUR_BLOCK.search(text)))
+    buyer = (_first_group(CLIENT_BLOCK.search(text)) or
+             _first_group(DESTINATAIRE_BLOCK.search(text)))
+    return _clean_block(seller), _clean_block(buyer)
 
-def _sanitize_party_block(block: str, max_lines: int = 6, min_len: int = 5) -> str:
-    """Nettoie un bloc Partie: retire lignes vides/bruit, limite la taille, rejette faux positifs."""
-    if not block:
-        return ""
-    lines = [l.strip() for l in block.splitlines()]
-    out = []
-    for l in lines:
-        if not l:
-            break  # s’arrête au premier saut de paragraphe
-        if HEADER_NOISE_RX.match(l):  # “FACTURE”, “INVOICE”
-            continue
-        if DATE_LINE_RX.match(l):     # ligne qui n’est qu’une date
-            continue
-        if ALL_NUMERIC_RX.match(l):   # lignes quasi numériques
-            continue
-        out.append(l)
-        if len(out) >= max_lines:
-            break
-    s = "\n".join(out).strip()
-    if len(s) < min_len:
-        return ""
-    return s
+def _fill_fields_from_text(text: str) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    fields["invoice_number"] = _extract_invoice_number(text)
+    fields["invoice_date"]   = _extract_invoice_date(text)
+    fields.update(_extract_totals(text))
+    seller, buyer = _extract_parties(text)
+    if seller: fields["seller"] = seller
+    if buyer:  fields["buyer"] = buyer
 
-def _extract_after_label(text: str, labels: list[str]) -> str:
-    """
-    Lit juste après le label (ex: 'ÉMETTEUR:') et renvoie un petit bloc (nom+adresse) nettoyé.
-    - coupe dès qu'on voit table/totaux/autre label
-    - rejette les "label-only" et les blocs trop courts
-    """
-    t = text or ""
-    for lab in labels:
-        m = re.search(rf'(?:^|\n)\s*{lab}\s*:?\s*(.*)', t, re.I)
-        if not m:
-            continue
-        tail = m.group(1)
-        # garde très peu de lignes: on évite d’aspirer la table
-        tail = "\n".join(tail.splitlines()[:8])
-        tail = _clip_at_stoppers(tail)
-        tail = _sanitize_party_block(tail)
-        if not tail or _is_label_only(tail):
-            continue
-        first_line = tail.splitlines()[0].strip() if tail else ""
-        if _is_label_only(first_line):
-            continue
-        return tail
-    return ""
-
-def _first_nonempty_lines(block: str, max_lines: int = 5) -> str:
-    """Garde les premières lignes non vides d’un bloc pour éviter de capturer trop."""
-    if not block:
-        return ""
-    lines = [l.strip() for l in block.splitlines() if l.strip()]
-    return "\n".join(lines[:max_lines]).strip()
-
-def _extract_parties_from_text(text: str) -> tuple[str | None, str | None]:
-    """
-    (seller, buyer) par ordre:
-      1) blocs regex (SELLER_BLOCK/CLIENT_BLOCK…)
-      2) fallback ancré (après labels)
-      3) heuristique tête de document pour seller
-    Le tout avec clipping/sanitizing pour éviter d’avaler la table.
-    """
-    seller = None
-    buyer  = None
-
-    # 1) Blocs explicites
-    m = SELLER_BLOCK.search(text or "") or EMETTEUR_BLOCK.search(text or "")
-    if m:
-        seller = _sanitize_party_block(_clip_at_stoppers(_clean_block(m.group("blk"))))
-    m = CLIENT_BLOCK.search(text or "") or DESTINATAIRE_BLOCK.search(text or "")
-    if m:
-        buyer = _sanitize_party_block(_clip_at_stoppers(_clean_block(m.group("blk"))))
-
-    # 2) Fallback ancré si manquant ou contaminé par des stop-words
-    if not seller or STOP_WORDS_RX.search(seller or "") or _is_label_only(seller):
-        s = _extract_after_label(text, ["ÉMETTEUR", "EMETTEUR", "Seller", "From", "Issuer", "Entreprise", "Company"])
-        if s:
-            seller = s
-    if not buyer or STOP_WORDS_RX.search(buyer or "") or _is_label_only(buyer):
-        b = _extract_after_label(text, ["DESTINATAIRE", "Client", "Buyer", r"Bill\s*to", r"Invoice\s*to", r"Ship\s*to"])
-        if b:
-            buyer = b
-
-    # 3) Heuristique tête de document pour seller (si toujours vide)
-    if not seller or _is_label_only(seller):
-        head = "\n".join((text or "").splitlines()[:15])
-        head = re.sub(r"file://[^\n]+", "", head, flags=re.I)
-        head = _clip_at_stoppers(_clean_block(head.split("\n\n")[0]))
-        head = _sanitize_party_block(head, max_lines=6)
-        if head and not _is_label_only(head):
-            seller = head
-
-    # Nettoyage final : rejeter label-only / blocs contaminés
-    if seller and (_is_label_only(seller) or STOP_WORDS_RX.search(seller)):
-        seller = ""
-    if buyer and (_is_label_only(buyer) or STOP_WORDS_RX.search(buyer)):
-        buyer = ""
-
-    seller = seller or None
-    buyer  = buyer  or None
-    return seller, buyer
-
-# ---------- Remplissage principal ----------
-
-def _fill_fields_from_text(result: dict, text: str) -> None:
-    text = _normalize_ocr_text(text or "")
-    fields = result["fields"]
-
-    # Numéro facture
-    m_num = FACTURE_NO_RE.search(text) or INVOICE_NUM_RE.search(text) or NUM_RE.search(text)
-    if m_num:
-        fields["invoice_number"] = m_num.group(1).strip()
-
-    # Date
-    m_date = DATE_RE.search(text)
-    if m_date:
-        try:
-            from dateutil import parser as dateparser
-            raw = re.sub(r"\s*([\/\-.])\s*", r"\1", m_date.group(1))
-            fields["invoice_date"] = dateparser.parse(raw, dayfirst=True).date().isoformat()
-        except Exception:
-            fields.setdefault("invoice_date", None)
-
-    # Totaux
-    total_ttc = None
-    near = TOTAL_TTC_NEAR_RE.findall(text)
-    if near:
-        total_ttc = _norm_amount(near[-1])
-    if total_ttc is None:
-        m_strict = EUR_STRICT_RE.findall(text)
-        if m_strict:
-            total_ttc = _norm_amount(m_strict[-1])
-    if total_ttc is not None:
-        fields["total_ttc"] = total_ttc
-
-    m_ht = TOTAL_HT_NEAR_RE.search(text)
-    if m_ht:
-        ht_val = _norm_amount(m_ht.group(1))
-        if ht_val is not None:
-            fields["total_ht"] = ht_val
-
-    m_tva_amt = TVA_AMOUNT_NEAR_RE.search(text)
-    if m_tva_amt:
-        tva_val = _norm_amount(m_tva_amt.group(1))
-        if tva_val is not None:
-            fields["total_tva"] = tva_val
-
-    # Currency
-    if re.search(r"\bEUR\b|€", text, re.I): fields["currency"] = "EUR"
-    elif re.search(r"\bGBP\b|£", text, re.I): fields["currency"] = "GBP"
-    elif re.search(r"\bCHF\b", text, re.I): fields["currency"] = "CHF"
-    elif re.search(r"\bUSD\b|\$", text, re.I): fields["currency"] = "USD"
-
-    # Parties (seller/buyer)
-    s, b = _extract_parties_from_text(text)
-    if not fields.get("seller") or _is_label_only(fields.get("seller")):
-        if s and not _is_label_only(s):
-            fields["seller"] = s
-    if not fields.get("buyer") or _is_label_only(fields.get("buyer")):
-        if b and not _is_label_only(b):
-            fields["buyer"] = b
-
-    # IDs FR
-    if not fields.get("seller_tva"):
-        m = TVA_RE.search(text)
-        if m: fields["seller_tva"] = m.group(0).replace(" ", "")
-    if not fields.get("seller_siret"):
-        m = SIRET_RE.search(text)
-        if m:
-            fields["seller_siret"] = m.group(0)
-        else:
-            m2 = SIREN_RE.search(text)
-            if m2:
-                fields["seller_siret"] = m2.group(0)
-    if not fields.get("seller_iban"):
-        m = IBAN_RE.search(text)
-        if m:
-            fields["seller_iban"] = m.group(0).replace(" ", "")
+    tva = _first_group(TVA_RE.search(text))
+    if tva: fields["seller_vat"] = tva
+    siret = _first_group(SIRET_RE.search(text))
+    if siret: fields["seller_siret"] = siret
+    siren = _first_group(SIREN_RE.search(text))
+    if siren: fields["seller_siren"] = siren
+    iban = _first_group(IBAN_RE.search(text))
+    if iban: fields["iban"] = iban
+    return fields
