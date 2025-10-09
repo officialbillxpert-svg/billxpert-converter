@@ -1,6 +1,6 @@
-
+# app/main.py
 from __future__ import annotations
-import io
+import os
 from pathlib import Path
 from typing import Any, Dict
 from flask import Flask, request, jsonify
@@ -15,9 +15,35 @@ def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app)
 
-    @app.get("/health")
+    # -- s'assure que instance_path existe pour les uploads (et éviter tout blocage IO)
+    try:
+        Path(app.instance_path).mkdir(parents=True, exist_ok=True)
+        (Path(app.instance_path) / "uploads").mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    @app.get("/")            # Render ping souvent "/"
+    def root():
+        return jsonify({"ok": True, "service": "billxpert-converter", "path": "/"}), 200
+
+    @app.get("/health")      # compat
     def health():
-        return jsonify({"ok": True})
+        return jsonify({"ok": True}), 200
+
+    @app.get("/healthz")     # compat Render / render.yaml
+    def healthz():
+        return jsonify({"ok": True, "service": "billxpert-converter"}), 200
+
+    @app.get("/debug/info")  # utile pour logs
+    def debug_info():
+        import shutil, sys
+        bins = {
+            "tesseract": shutil.which("tesseract") or "",
+            "pdftoppm": shutil.which("pdftoppm") or "",
+            "python": sys.executable,
+            "port": os.getenv("PORT", ""),
+        }
+        return jsonify({"ok": True, "bins": bins}), 200
 
     @app.post("/summary")
     def api_summary():
@@ -29,7 +55,6 @@ def create_app() -> Flask:
             if ext not in ALLOWED_EXTS:
                 return _json_err("unsupported_type", f"Extension non supportée: {ext}", 415)
 
-            # save to a temp file
             tmp = Path(app.instance_path) / "uploads"
             tmp.mkdir(parents=True, exist_ok=True)
             safe_name = secure_filename(file.filename)
@@ -58,3 +83,9 @@ def create_app() -> Flask:
 
 def _json_err(code: str, msg: str, status: int):
     return jsonify({"ok": False, "error": {"code": code, "message": msg}}), status
+
+# 👉 si tu n'utilises PAS wsgi.py, expose l'instance ici
+try:
+    app  # type: ignore
+except NameError:
+    app = create_app()
