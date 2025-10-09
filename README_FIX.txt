@@ -1,0 +1,1 @@
+Fixed core extractor files for Version 1 — Partie 3.
