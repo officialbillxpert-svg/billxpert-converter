@@ -15,26 +15,25 @@ def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app)
 
-    # -- s'assure que instance_path existe pour les uploads (et éviter tout blocage IO)
     try:
         Path(app.instance_path).mkdir(parents=True, exist_ok=True)
         (Path(app.instance_path) / "uploads").mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
 
-    @app.get("/")            # Render ping souvent "/"
+    @app.get("/")
     def root():
         return jsonify({"ok": True, "service": "billxpert-converter", "path": "/"}), 200
 
-    @app.get("/health")      # compat
+    @app.get("/health")
     def health():
         return jsonify({"ok": True}), 200
 
-    @app.get("/healthz")     # compat Render / render.yaml
+    @app.get("/healthz")
     def healthz():
         return jsonify({"ok": True, "service": "billxpert-converter"}), 200
 
-    @app.get("/debug/info")  # utile pour logs
+    @app.get("/debug/info")
     def debug_info():
         import shutil, sys
         bins = {
@@ -61,8 +60,10 @@ def create_app() -> Flask:
             dest = tmp / safe_name
             file.save(dest)
 
-            ocr_mode = (request.args.get("ocr") or "auto").lower()
-            data = extract_document(str(dest), ocr=ocr_mode) or {}
+            ocr_mode = (request.args.get("ocr") or "auto").lower()         # auto | force | off
+            engine   = (request.args.get("engine") or "auto").lower()      # auto | tesseract | paddle
+
+            data = extract_document(str(dest), ocr=ocr_mode, engine=engine) or {}
             fields: Dict[str, Any] = data.get("fields") or {}
             meta: Dict[str, Any] = data.get("meta") or {}
 
@@ -84,7 +85,6 @@ def create_app() -> Flask:
 def _json_err(code: str, msg: str, status: int):
     return jsonify({"ok": False, "error": {"code": code, "message": msg}}), status
 
-# 👉 si tu n'utilises PAS wsgi.py, expose l'instance ici
 try:
     app  # type: ignore
 except NameError:
